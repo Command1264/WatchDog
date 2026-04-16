@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import logging
+import sys
+
+import pytest
 from PySide6.QtCore import QObject, QPoint, Qt, Signal
 from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtTest import QTest
@@ -8,6 +12,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon, QWidge
 from watchdog_app.app import (
     AppController,
     LeftClickOnlyMenu,
+    _install_exception_hooks,
     _load_bootstrap_state_with_recovery,
     _load_config_with_recovery,
 )
@@ -471,6 +476,24 @@ def test_load_bootstrap_state_with_recovery_moves_invalid_file_aside(monkeypatch
     assert len(list(tmp_path.glob("bootstrap.invalid.*.json"))) == 1
 
 
+def test_load_bootstrap_state_with_recovery_logs_warning(monkeypatch, tmp_path, caplog) -> None:
+    bootstrap_file = tmp_path / "bootstrap.json"
+    bootstrap_file.write_text("{ invalid", encoding="utf-8")
+
+    def _raise():
+        raise ValueError("broken bootstrap")
+
+    monkeypatch.setattr("watchdog_app.app.bootstrap_path", lambda: bootstrap_file)
+    monkeypatch.setattr("watchdog_app.app.load_bootstrap_state", _raise)
+
+    with caplog.at_level(logging.WARNING):
+        _load_bootstrap_state_with_recovery()
+
+    records = [record for record in caplog.records if record.name == "watchdog_app.app"]
+    assert any(record.levelno == logging.WARNING for record in records)
+    assert not any(record.levelno >= logging.ERROR for record in records)
+
+
 def test_load_config_with_recovery_moves_invalid_file_aside(monkeypatch, tmp_path) -> None:
     config_file = tmp_path / "config.json"
     config_file.write_text("{ invalid", encoding="utf-8")
@@ -487,6 +510,34 @@ def test_load_config_with_recovery_moves_invalid_file_aside(monkeypatch, tmp_pat
     assert "設定檔讀取失敗" in warning
     assert not config_file.exists()
     assert len(list(tmp_path.glob("config.invalid.*.json"))) == 1
+
+
+def test_exception_hook_logs_error_and_exits(monkeypatch, caplog) -> None:
+    exit_codes: list[int] = []
+    monkeypatch.setattr("watchdog_app.app.logging.shutdown", lambda: None)
+
+    def _exit(code: int) -> None:
+        exit_codes.append(code)
+        raise SystemExit(code)
+
+    monkeypatch.setattr("watchdog_app.app.os._exit", _exit)
+
+    old_sys, old_thread = _install_exception_hooks()
+    try:
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(SystemExit) as exc_info:
+                sys.excepthook(ValueError, ValueError("boom"), None)
+    finally:
+        sys.excepthook = old_sys
+        import threading
+
+        threading.excepthook = old_thread
+
+    assert exc_info.value.code == ExitReason.CRITICAL_EXCEPTION.value
+    assert exit_codes == [ExitReason.CRITICAL_EXCEPTION.value]
+    records = [record for record in caplog.records if record.name == "watchdog_app.app"]
+    assert any(record.levelno == logging.ERROR for record in records)
+    assert not any(record.levelno == logging.CRITICAL for record in records)
 
 
 def test_open_system_settings_dialog_persists_disabled_provider_as_none(monkeypatch, qtbot, tmp_path) -> None:

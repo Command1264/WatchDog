@@ -31,7 +31,7 @@ from ..models import (
     StoragePreferences,
 )
 from ..launchers import infer_process_match
-from ..storage import resolve_paths
+from ..storage import log_output_root, resolve_paths
 
 
 def _localize_dialog_buttons(buttons: QDialogButtonBox) -> None:
@@ -183,7 +183,7 @@ class SystemSettingsDialog(QDialog):
         else:
             preview = resolve_paths(preview_prefs)
         self._config_path_label.setText(str(preview.config_path))
-        self._log_path_label.setText(str(preview.log_directory))
+        self._log_path_label.setText(str(log_output_root(preview.log_directory)))
 
     def storage_preferences(self) -> StoragePreferences:
         return StoragePreferences(

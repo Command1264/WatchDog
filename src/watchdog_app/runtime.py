@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 
-from .models import APP_NAME, BOOTSTRAP_FILE_NAME, CONFIG_FILE_NAME, ExitReason, LOG_FILE_NAME
+from .models import APP_NAME, BOOTSTRAP_FILE_NAME, CONFIG_FILE_NAME, ExitReason, LOGS_DIRECTORY_NAME
 
 
 def is_frozen() -> bool:
@@ -61,7 +61,7 @@ def default_config_path() -> Path:
 
 
 def default_log_path() -> Path:
-    return local_appdata_dir() / LOG_FILE_NAME
+    return local_appdata_dir() / LOGS_DIRECTORY_NAME
 
 
 def child_command() -> list[str]:

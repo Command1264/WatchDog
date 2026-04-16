@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import logging
 import subprocess
 import tempfile
 import winreg
@@ -16,6 +17,9 @@ TASK_NAME_CURRENT_USER = f"{APP_NAME} AutoStart (Current User)"
 TASK_NAME_ALL_USERS = f"{APP_NAME} AutoStart (All Users)"
 USERS_GROUP_SID = "S-1-5-32-545"
 TASK_XML_NAMESPACE = "http://schemas.microsoft.com/windows/2004/02/mit/task"
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -274,18 +278,35 @@ def apply_autostart(scope: AutoStartScope | str) -> AutoStartStatus:
     remove_scheduled_task()
 
     if scope == AutoStartScope.DISABLED:
+        logger.info("Autostart disabled.")
         return AutoStartStatus(scope=scope, provider=None, enabled=False)
 
     try:
-        return install_registry_run(scope)
+        status = install_registry_run(scope)
+        logger.info("Autostart enabled via registry run entry. scope=%s", scope.value)
+        return status
     except OSError as registry_exc:
+        logger.warning(
+            "Registry autostart unavailable; trying scheduled task fallback. scope=%s error=%s",
+            scope.value,
+            registry_exc,
+        )
         try:
-            return install_scheduled_task(scope)
+            status = install_scheduled_task(scope)
+            logger.info("Autostart enabled via scheduled task. scope=%s", scope.value)
+            return status
         except OSError as task_exc:
             if scope == AutoStartScope.ALL_USERS and (
                 _is_access_denied_error(registry_exc) or _is_access_denied_error(task_exc)
             ):
+                logger.warning("All-users autostart requires administrative privileges.")
                 raise OSError(
                     "所有使用者自動啟動需要系統管理員權限。請改用「目前使用者」，或以系統管理員身分執行 WatchDog 後再儲存。"
                 ) from task_exc
+            logger.error(
+                "Failed to apply autostart. scope=%s registry_error=%s scheduled_task_error=%s",
+                scope.value,
+                registry_exc,
+                task_exc,
+            )
             raise

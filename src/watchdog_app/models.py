@@ -11,7 +11,7 @@ import uuid
 APP_NAME = "WatchDog"
 CONFIG_FILE_NAME = "config.json"
 BOOTSTRAP_FILE_NAME = "bootstrap.json"
-LOG_FILE_NAME = "watchdog.log"
+LOGS_DIRECTORY_NAME = "WatchDogLogs"
 MIN_INTERVAL_SECONDS = 0.05
 
 

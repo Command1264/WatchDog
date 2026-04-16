@@ -27,6 +27,7 @@ if __package__ in {None, ""}:
     from watchdog_app.single_instance import SingleInstanceCoordinator
     from watchdog_app.storage import (
         effective_storage_preferences,
+        log_output_root,
         load_bootstrap_state,
         load_config,
         resolve_paths,
@@ -44,6 +45,7 @@ else:
     from .single_instance import SingleInstanceCoordinator
     from .storage import (
         effective_storage_preferences,
+        log_output_root,
         load_bootstrap_state,
         load_config,
         resolve_paths,
@@ -79,7 +81,7 @@ def _load_bootstrap_state_with_recovery() -> tuple[BootstrapState, str | None]:
     except Exception as exc:
         source_path = bootstrap_path()
         backup_path = _move_aside_invalid_file(source_path, "invalid")
-        logger.exception("Failed to load bootstrap state from %s", source_path)
+        logger.warning("Bootstrap state was invalid and will be reset. path=%s error=%s", source_path, exc)
         lines = [
             f"啟動設定檔讀取失敗：{exc}",
             "WatchDog 將改用首次啟動流程繼續執行。",
@@ -96,7 +98,7 @@ def _load_config_with_recovery(path: Path) -> tuple[AppConfig, str | None]:
         return load_config(path), None
     except Exception as exc:
         backup_path = _move_aside_invalid_file(path, "invalid")
-        logger.exception("Failed to load config from %s", path)
+        logger.warning("Config file was invalid and will be reset. path=%s error=%s", path, exc)
         lines = [
             f"設定檔讀取失敗：{exc}",
             "WatchDog 將改用預設設定繼續執行。",
@@ -322,12 +324,14 @@ class AppController(QObject):
 
     def start_monitoring(self) -> None:
         self._monitor.start()
+        logger.info("Monitoring started.")
         self._window.set_monitoring_running(True)
         self._toggle_action.setText("關閉偵測")
         self._apply_status_icon(True)
 
     def stop_monitoring(self) -> None:
         self._monitor.stop()
+        logger.info("Monitoring stopped.")
         self._window.set_monitoring_running(False)
         self._toggle_action.setText("啟動偵測")
         self._apply_status_icon(False)
@@ -450,9 +454,12 @@ class AppController(QObject):
             candidate.auto_start_provider = status.provider or AutoStartProvider.NONE
             save_config(candidate, planned_paths.config_path)
             resolved = update_bootstrap_for_storage(effective_storage)
-            configure_logging(resolved.log_directory)
+            active_log_path = configure_logging(resolved.log_directory)
         except Exception as exc:
-            logger.exception("Failed to persist system settings.")
+            if "需要系統管理員權限" in str(exc):
+                logger.warning("Failed to persist system settings: %s", exc)
+            else:
+                logger.exception("Failed to persist system settings.")
             rollback_errors = self._rollback_system_settings(
                 previous_config,
                 previous_resolved_paths,
@@ -469,7 +476,19 @@ class AppController(QObject):
         self._resolved_paths = resolved
         self._window.set_resolved_paths(resolved)
         self._apply_live_config(candidate)
+        logger.info(
+            "Persisted system settings. config_path=%s log_root=%s active_log=%s auto_start_scope=%s",
+            resolved.config_path,
+            log_output_root(resolved.log_directory),
+            active_log_path,
+            scope.value,
+        )
         if effective_storage != requested_storage:
+            logger.warning(
+                "Requested EXE storage was not writable; falling back to config=%s log=%s.",
+                candidate.storage.config_mode.value,
+                candidate.storage.log_mode.value,
+            )
             QMessageBox.warning(
                 self._window,
                 "儲存位置已回退",
@@ -506,6 +525,7 @@ class AppController(QObject):
         self._app.exit(reason.value)
 
     def _handle_session_end(self, *args) -> None:
+        logger.info("OS session end requested application shutdown.")
         self._request_exit(ExitReason.OS_SESSION_END)
 
     def _about_to_quit(self) -> None:
@@ -604,7 +624,7 @@ def _install_exception_hooks() -> tuple[object, object]:
     old_thread = threading.excepthook
 
     def _sys_hook(exc_type, exc_value, exc_traceback) -> None:
-        logger.critical(
+        logger.error(
             "Unhandled exception:\n%s",
             "".join(traceback.format_exception(exc_type, exc_value, exc_traceback)),
         )
@@ -612,7 +632,7 @@ def _install_exception_hooks() -> tuple[object, object]:
         os._exit(ExitReason.CRITICAL_EXCEPTION.value)
 
     def _thread_hook(args) -> None:
-        logger.critical(
+        logger.error(
             "Unhandled thread exception:\n%s",
             "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)),
         )
@@ -645,8 +665,9 @@ def run_child_app() -> int:
             selected_storage = bootstrap.storage
             resolved_paths = resolve_paths(bootstrap.storage)
 
-        configure_logging(resolved_paths.log_directory)
+        active_log_path = configure_logging(resolved_paths.log_directory)
         old_sys_hook, old_thread_hook = _install_exception_hooks()
+        logger.info("Logging configured. active_log=%s", active_log_path)
     except KeyboardInterrupt:
         return ExitReason.CTRL_C_EXIT.value
     except Exception:

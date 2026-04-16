@@ -9,7 +9,7 @@ from .models import (
     BOOTSTRAP_FILE_NAME,
     BootstrapState,
     CONFIG_FILE_NAME,
-    LOG_FILE_NAME,
+    LOGS_DIRECTORY_NAME,
     ResolvedPaths,
     StorageMode,
     StoragePreferences,
@@ -146,5 +146,5 @@ def update_bootstrap_for_storage(storage: StoragePreferences) -> ResolvedPaths:
     return resolved
 
 
-def log_file_path(log_directory: Path) -> Path:
-    return log_directory / LOG_FILE_NAME
+def log_output_root(log_directory: Path) -> Path:
+    return log_directory / LOGS_DIRECTORY_NAME

@@ -81,7 +81,7 @@ def test_system_settings_dialog_inlines_storage_and_autostart_controls(qtbot, tm
     assert dialog._scope_combo.currentData() == AutoStartScope.CURRENT_USER
     assert dialog._start_checkbox.isChecked() is True
     assert dialog._config_path_label.text() == str(tmp_path / "config.json")
-    assert dialog._log_path_label.text() == str(tmp_path / "logs")
+    assert dialog._log_path_label.text() == str(tmp_path / "logs" / "WatchDogLogs")
     assert dialog._save_button.text() == "儲存"
     assert dialog._cancel_button.text() == "取消"
 

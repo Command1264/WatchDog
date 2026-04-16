@@ -145,6 +145,7 @@ class MonitorEngine:
                     daemon=True,
                 )
                 self._thread.start()
+        logger.info("Monitoring engine started. enabled_targets=%s", len(self._startup_queue))
         self._emit(None, None, "監測已啟動。")
 
     def stop(self) -> None:
@@ -158,6 +159,7 @@ class MonitorEngine:
                 state.status = TargetStatus.STOPPED if target.enabled else TargetStatus.DISABLED
                 state.last_error = ""
                 state.last_error_detail = ""
+        logger.info("Monitoring engine stopped.")
         self._emit(None, None, "監測已停止。")
 
     def shutdown(self) -> None:
@@ -180,6 +182,7 @@ class MonitorEngine:
             state.status = TargetStatus.RUNNING
             state.last_error = ""
             state.last_error_detail = ""
+        logger.info("Manual target launch succeeded. target=%s pid=%s", target.id, result.pid)
         self._emit(target.id, TargetStatus.RUNNING, "已手動啟動目標。")
         return result
 
@@ -262,7 +265,7 @@ class MonitorEngine:
             self._record_error(target.id, str(exc))
             return None
         except Exception as exc:
-            self._record_error(target.id, f"{type(exc).__name__}: {exc}")
+            self._record_error(target.id, f"{type(exc).__name__}: {exc}", include_traceback=True)
             return None
 
         with self._lock:
@@ -278,6 +281,7 @@ class MonitorEngine:
             state.status = TargetStatus.RUNNING
             state.last_error = ""
             state.last_error_detail = ""
+        logger.info("Startup check passed; launch skipped. target=%s", target.id)
         self._emit(target.id, state.status, "啟動時檢查通過，略過啟動。")
         return True
 
@@ -337,7 +341,7 @@ class MonitorEngine:
             except (ConfigValidationError, OSError) as exc:
                 self._record_error(target.id, str(exc))
             except Exception as exc:
-                self._record_error(target.id, f"{type(exc).__name__}: {exc}")
+                self._record_error(target.id, f"{type(exc).__name__}: {exc}", include_traceback=True)
 
     def _launch_target(self, target, now: float, now_wall: float, message: str) -> None:
         with self._lock:
@@ -367,10 +371,14 @@ class MonitorEngine:
             state.status = TargetStatus.RUNNING
             state.last_error = ""
             state.last_error_detail = ""
+        logger.info("Target launch succeeded. target=%s pid=%s mode=%s", target.id, result.pid, message)
         self._emit(target.id, state.status, f"{message}：PID={result.pid}")
 
-    def _record_error(self, target_id: str, message: str) -> None:
-        logger.exception("Target %s operation failed: %s", target_id, message)
+    def _record_error(self, target_id: str, message: str, *, include_traceback: bool = False) -> None:
+        if include_traceback:
+            logger.exception("Target %s operation failed: %s", target_id, message)
+        else:
+            logger.error("Target %s operation failed: %s", target_id, message)
         with self._lock:
             state = self._states.get(target_id)
             if state is None:
