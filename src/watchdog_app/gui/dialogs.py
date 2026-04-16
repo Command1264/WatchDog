@@ -192,9 +192,12 @@ class SystemSettingsDialog(QDialog):
         ).validate()
 
     def values(self) -> tuple[StoragePreferences, AutoStartScope, bool]:
+        scope = self._scope_combo.currentData()
+        if not isinstance(scope, AutoStartScope):
+            scope = AutoStartScope(str(scope))
         return (
             self.storage_preferences(),
-            self._scope_combo.currentData(),
+            scope,
             self._start_checkbox.isChecked(),
         )
 

@@ -81,6 +81,45 @@ def test_apply_autostart_raises_when_existing_entries_cannot_be_cleared(monkeypa
         autostart.apply_autostart(AutoStartScope.CURRENT_USER)
 
 
+def test_apply_autostart_all_users_reports_admin_requirement_on_access_denied(monkeypatch: object) -> None:
+    monkeypatch.setattr(autostart, "remove_registry_run", lambda scope: None)
+    monkeypatch.setattr(autostart, "remove_scheduled_task", lambda scope=None: None)
+
+    def _fail_registry(scope: AutoStartScope):
+        raise PermissionError(5, "Access is denied")
+
+    def _fail_task(scope: AutoStartScope):
+        raise OSError("ERROR: Access is denied.")
+
+    monkeypatch.setattr(autostart, "install_registry_run", _fail_registry)
+    monkeypatch.setattr(autostart, "install_scheduled_task", _fail_task)
+
+    with pytest.raises(OSError, match="需要系統管理員權限"):
+        autostart.apply_autostart(AutoStartScope.ALL_USERS)
+
+
+def test_apply_autostart_accepts_string_scope(monkeypatch: object) -> None:
+    calls: list[AutoStartScope] = []
+
+    monkeypatch.setattr(autostart, "remove_registry_run", lambda scope: None)
+    monkeypatch.setattr(autostart, "remove_scheduled_task", lambda scope=None: None)
+
+    def _install_registry(scope):
+        calls.append(scope)
+        return autostart.AutoStartStatus(
+            scope=scope,
+            provider=AutoStartProvider.REGISTRY_RUN,
+            enabled=True,
+        )
+
+    monkeypatch.setattr(autostart, "install_registry_run", _install_registry)
+
+    status = autostart.apply_autostart("all_users")
+
+    assert status.scope == AutoStartScope.ALL_USERS
+    assert calls == [AutoStartScope.ALL_USERS]
+
+
 def test_detect_autostart_queries_scope_specific_scheduled_task_names(monkeypatch: object) -> None:
     commands: list[list[str]] = []
 
@@ -107,20 +146,25 @@ def test_install_scheduled_task_rejects_all_users_scope() -> None:
     xml_text = autostart._all_users_task_xml()
 
     assert autostart.USERS_GROUP_SID in xml_text
-    assert "<LogonType>Group</LogonType>" in xml_text
+    assert "<LogonType>Group</LogonType>" not in xml_text
     assert "<LogonTrigger>" in xml_text
 
 
 def test_install_scheduled_task_all_users_uses_xml_import(monkeypatch: object, tmp_path: Path) -> None:
     commands: list[list[str]] = []
+    written_payloads: list[bytes] = []
 
     class _FakeFile:
         def __init__(self) -> None:
             self.name = str(tmp_path / "task.xml")
             self.path = Path(self.name)
 
-        def write(self, text: str) -> None:
-            self.path.write_text(text, encoding="utf-8")
+        def write(self, content) -> None:
+            if isinstance(content, bytes):
+                written_payloads.append(content)
+                self.path.write_bytes(content)
+            else:
+                self.path.write_text(content, encoding="utf-8")
 
         def __enter__(self):
             return self
@@ -156,6 +200,8 @@ def test_install_scheduled_task_all_users_uses_xml_import(monkeypatch: object, t
             "/f",
         ]
     ]
+    assert written_payloads
+    assert written_payloads[0].startswith(b"\xff\xfe") or written_payloads[0].startswith(b"\xfe\xff")
     assert not (tmp_path / "task.xml").exists()
 
 
