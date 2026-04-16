@@ -219,6 +219,18 @@ class LeftClickOnlyMenu(QMenu):
         self._action_guard.reset_pending_trigger()
         super().keyReleaseEvent(event)
 
+    def leaveEvent(self, event) -> None:  # type: ignore[override]
+        self._action_guard.reset_pending_trigger()
+        super().leaveEvent(event)
+
+    def focusOutEvent(self, event) -> None:  # type: ignore[override]
+        self._action_guard.reset_pending_trigger()
+        super().focusOutEvent(event)
+
+    def hideEvent(self, event) -> None:  # type: ignore[override]
+        self._schedule_pending_trigger_reset()
+        super().hideEvent(event)
+
 
 class AppController(QObject):
     monitor_event_signal = Signal(object)

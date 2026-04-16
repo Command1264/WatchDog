@@ -5,7 +5,7 @@ import sys
 
 import pytest
 from PySide6.QtCore import QObject, QPoint, Qt, Signal
-from PySide6.QtGui import QIcon, QPixmap
+from PySide6.QtGui import QFocusEvent, QIcon, QPixmap
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon, QWidget
 
@@ -330,6 +330,71 @@ def test_tray_action_runs_with_valid_left_click_even_inside_popup_guard_window(
     assert controller._monitor.is_running() is True
 
 
+def test_tray_action_release_without_matching_press_is_blocked(monkeypatch, qtbot, tmp_path) -> None:
+    app = QApplication.instance()
+    assert app is not None
+
+    monkeypatch.setattr("watchdog_app.app.MonitorEngine", DummyMonitorEngine)
+    monkeypatch.setattr("watchdog_app.app.MainWindow", DummyMainWindow)
+    monkeypatch.setattr("watchdog_app.app.QSystemTrayIcon", DummyTrayIcon)
+    monkeypatch.setattr(
+        "watchdog_app.app.AppController._load_status_icons",
+        lambda self: (_solid_icon(Qt.GlobalColor.green), _solid_icon(Qt.GlobalColor.red)),
+    )
+
+    controller = AppController(
+        app,
+        AppConfig.default(),
+        ResolvedPaths(
+            bootstrap_path=tmp_path / "bootstrap.json",
+            config_path=tmp_path / "config.json",
+            log_directory=tmp_path / "logs",
+        ),
+        DummySingleInstance(),
+    )
+    qtbot.addWidget(controller._window)
+
+    controller._tray_action_guard.mark_popup_started()
+    controller._tray_action_guard.note_release(controller._toggle_action, Qt.MouseButton.LeftButton)
+    controller._toggle_action.trigger()
+
+    assert controller._monitor.is_running() is False
+
+
+def test_tray_action_press_and_release_on_different_actions_is_blocked(monkeypatch, qtbot, tmp_path) -> None:
+    app = QApplication.instance()
+    assert app is not None
+
+    monkeypatch.setattr("watchdog_app.app.MonitorEngine", DummyMonitorEngine)
+    monkeypatch.setattr("watchdog_app.app.MainWindow", DummyMainWindow)
+    monkeypatch.setattr("watchdog_app.app.QSystemTrayIcon", DummyTrayIcon)
+    monkeypatch.setattr(
+        "watchdog_app.app.AppController._load_status_icons",
+        lambda self: (_solid_icon(Qt.GlobalColor.green), _solid_icon(Qt.GlobalColor.red)),
+    )
+
+    controller = AppController(
+        app,
+        AppConfig.default(),
+        ResolvedPaths(
+            bootstrap_path=tmp_path / "bootstrap.json",
+            config_path=tmp_path / "config.json",
+            log_directory=tmp_path / "logs",
+        ),
+        DummySingleInstance(),
+    )
+    qtbot.addWidget(controller._window)
+
+    exit_action = next(action for action in controller._tray_menu.actions() if action.text() == "結束")
+
+    controller._tray_action_guard.mark_popup_started()
+    controller._tray_action_guard.note_press(controller._toggle_action, Qt.MouseButton.LeftButton)
+    controller._tray_action_guard.note_release(exit_action, Qt.MouseButton.LeftButton)
+    controller._toggle_action.trigger()
+
+    assert controller._monitor.is_running() is False
+
+
 def test_tray_menu_hide_defers_token_reset_until_next_event_loop(monkeypatch, qtbot, tmp_path) -> None:
     app = QApplication.instance()
     assert app is not None
@@ -369,6 +434,39 @@ def test_tray_menu_hide_defers_token_reset_until_next_event_loop(monkeypatch, qt
     controller._toggle_action.trigger()
 
     assert controller._monitor.is_running() is True
+
+
+def test_tray_menu_focus_out_resets_pending_left_click_token(monkeypatch, qtbot, tmp_path) -> None:
+    app = QApplication.instance()
+    assert app is not None
+
+    monkeypatch.setattr("watchdog_app.app.MonitorEngine", DummyMonitorEngine)
+    monkeypatch.setattr("watchdog_app.app.MainWindow", DummyMainWindow)
+    monkeypatch.setattr("watchdog_app.app.QSystemTrayIcon", DummyTrayIcon)
+    monkeypatch.setattr(
+        "watchdog_app.app.AppController._load_status_icons",
+        lambda self: (_solid_icon(Qt.GlobalColor.green), _solid_icon(Qt.GlobalColor.red)),
+    )
+
+    controller = AppController(
+        app,
+        AppConfig.default(),
+        ResolvedPaths(
+            bootstrap_path=tmp_path / "bootstrap.json",
+            config_path=tmp_path / "config.json",
+            log_directory=tmp_path / "logs",
+        ),
+        DummySingleInstance(),
+    )
+    qtbot.addWidget(controller._window)
+
+    controller._tray_action_guard.mark_popup_started()
+    controller._tray_action_guard.note_press(controller._toggle_action, Qt.MouseButton.LeftButton)
+    controller._tray_action_guard.note_release(controller._toggle_action, Qt.MouseButton.LeftButton)
+    controller._tray_menu.focusOutEvent(QFocusEvent(QFocusEvent.Type.FocusOut))
+    controller._toggle_action.trigger()
+
+    assert controller._monitor.is_running() is False
 
 
 def test_tray_menu_popup_offsets_and_ignores_reentry(monkeypatch, qtbot, tmp_path) -> None:
