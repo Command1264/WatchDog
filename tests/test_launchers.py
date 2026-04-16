@@ -3,8 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
+import pytest
+
 from watchdog_app.launchers import build_command, infer_process_match
-from watchdog_app.models import LaunchKind, LaunchSpec
+from watchdog_app.models import ConfigValidationError, LaunchKind, LaunchSpec
 
 
 def test_python_launch_uses_current_interpreter() -> None:
@@ -35,3 +37,26 @@ def test_infer_process_match_for_batch_file_uses_cmd_host() -> None:
     assert inferred.process_name == "cmd.exe"
     assert Path(inferred.executable_path).name.casefold() == "cmd.exe"
     assert "cmd.exe" in inferred.note
+
+
+def test_frozen_python_launch_uses_discovered_python_host(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(
+        "watchdog_app.launchers.shutil.which",
+        lambda name: "C:/Python311/python.exe" if name == "python.exe" else None,
+    )
+
+    command = build_command(LaunchSpec(path="C:/demo.py", args=["--ok"], kind=LaunchKind.PYTHON))
+    inferred = infer_process_match("C:/demo.py")
+
+    assert command == ["C:/Python311/python.exe", "C:/demo.py", "--ok"]
+    assert inferred.process_name == "python.exe"
+    assert inferred.executable_path == "C:/Python311/python.exe"
+
+
+def test_frozen_python_launch_raises_when_python_host_is_unavailable(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr("watchdog_app.launchers.shutil.which", lambda _name: None)
+
+    with pytest.raises(ConfigValidationError, match="找不到可用的 Python 直譯器"):
+        build_command(LaunchSpec(path="C:/demo.py", kind=LaunchKind.PYTHON))

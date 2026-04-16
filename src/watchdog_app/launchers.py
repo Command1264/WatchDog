@@ -60,11 +60,24 @@ def infer_process_match(path: str) -> ProcessMatchInference:
             note="PowerShell 腳本實際會由 powershell.exe 執行，名稱檢查將比對 powershell.exe。",
         )
 
+    python_host = _python_host_executable()
     return ProcessMatchInference(
-        process_name=Path(sys.executable).name,
-        executable_path=sys.executable,
-        note="Python 腳本實際會由目前的 Python 直譯器執行，名稱檢查將比對該直譯器。",
+        process_name=Path(python_host).name,
+        executable_path=python_host,
+        note="Python 腳本實際會由可用的 Python 直譯器執行，名稱檢查將比對該直譯器。",
     )
+
+
+def _python_host_executable() -> str:
+    if not getattr(sys, "frozen", False):
+        return sys.executable
+
+    for candidate in ("py.exe", "python.exe", "python"):
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+
+    raise ConfigValidationError("打包後找不到可用的 Python 直譯器，無法啟動 .py 目標。")
 
 
 def build_command(launch: LaunchSpec) -> list[str]:
@@ -72,7 +85,7 @@ def build_command(launch: LaunchSpec) -> list[str]:
     kind = launch.kind if launch.kind != LaunchKind.AUTO else detect_launch_kind(launch.path)
 
     if kind == LaunchKind.PYTHON:
-        return [sys.executable, launch.path, *launch.args]
+        return [_python_host_executable(), launch.path, *launch.args]
     if kind == LaunchKind.POWERSHELL:
         return ["powershell.exe", "-ExecutionPolicy", "Bypass", "-File", launch.path, *launch.args]
     if kind == LaunchKind.CMD:

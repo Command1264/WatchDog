@@ -23,9 +23,20 @@ def configure_logging(log_directory: Path) -> Path:
     if existing:
         return path
 
+    removed_handlers: list[RotatingFileHandler] = []
     for handler in list(root_logger.handlers):
         if isinstance(handler, RotatingFileHandler):
             root_logger.removeHandler(handler)
+            removed_handlers.append(handler)
+
+    for handler in removed_handlers:
+        handler.close()
+
+    has_console_handler = any(
+        isinstance(handler, logging.StreamHandler)
+        and not isinstance(handler, RotatingFileHandler)
+        for handler in root_logger.handlers
+    )
 
     formatter = logging.Formatter(
         "%(asctime)s %(levelname)s [%(name)s] %(message)s",
@@ -40,7 +51,7 @@ def configure_logging(log_directory: Path) -> Path:
     file_handler.setFormatter(formatter)
     root_logger.addHandler(file_handler)
 
-    if not any(isinstance(handler, logging.StreamHandler) for handler in root_logger.handlers):
+    if not has_console_handler:
         console = logging.StreamHandler()
         console.setFormatter(formatter)
         root_logger.addHandler(console)

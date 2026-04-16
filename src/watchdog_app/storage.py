@@ -83,6 +83,25 @@ def resolve_paths(storage: StoragePreferences) -> ResolvedPaths:
     )
 
 
+def effective_storage_preferences(resolved: ResolvedPaths) -> StoragePreferences:
+    runtime_root = runtime_base_dir().resolve()
+    appdata_root = appdata_dir().resolve()
+    local_appdata_root = local_appdata_dir().resolve()
+
+    config_root = resolved.config_path.parent.resolve()
+    log_root = resolved.log_directory.resolve()
+
+    config_mode = StorageMode.EXE if config_root == runtime_root else StorageMode.APPDATA
+    log_mode = StorageMode.EXE if log_root == runtime_root else StorageMode.LOCALAPPDATA
+
+    if config_root not in {runtime_root, appdata_root}:
+        config_mode = StorageMode.APPDATA
+    if log_root not in {runtime_root, local_appdata_root}:
+        log_mode = StorageMode.LOCALAPPDATA
+
+    return StoragePreferences(config_mode=config_mode, log_mode=log_mode).validate()
+
+
 def discover_config_path() -> Path | None:
     state = load_bootstrap_state()
     if state.config_path:
@@ -115,9 +134,10 @@ def save_config(config: AppConfig, path: Path) -> Path:
 
 def update_bootstrap_for_storage(storage: StoragePreferences) -> ResolvedPaths:
     resolved = resolve_paths(storage)
+    effective_storage = effective_storage_preferences(resolved)
     save_bootstrap_state(
         BootstrapState(
-            storage=storage,
+            storage=effective_storage,
             config_path=str(resolved.config_path),
             log_directory=str(resolved.log_directory),
             first_run_completed=True,

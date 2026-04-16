@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 import logging
 import os
 import sys
@@ -11,7 +12,7 @@ from typing import Callable
 
 from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QCursor, QIcon, QMouseEvent, QPixmap
-from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QStyle, QSystemTrayIcon
+from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -20,10 +21,12 @@ if __package__ in {None, ""}:
     from watchdog_app.gui.dialogs import StorageSetupDialog, SystemSettingsDialog
     from watchdog_app.gui.main_window import MainWindow
     from watchdog_app.logging_utils import configure_logging
-    from watchdog_app.models import AppConfig, AutoStartProvider, ExitReason
+    from watchdog_app.models import AppConfig, AutoStartProvider, BootstrapState, ExitReason
     from watchdog_app.monitor import MonitorEngine
+    from watchdog_app.runtime import bootstrap_path, not_ready_icon_path, ready_icon_path
     from watchdog_app.single_instance import SingleInstanceCoordinator
     from watchdog_app.storage import (
+        effective_storage_preferences,
         load_bootstrap_state,
         load_config,
         resolve_paths,
@@ -35,10 +38,12 @@ else:
     from .gui.dialogs import StorageSetupDialog, SystemSettingsDialog
     from .gui.main_window import MainWindow
     from .logging_utils import configure_logging
-    from .models import AppConfig, AutoStartProvider, ExitReason
+    from .models import AppConfig, AutoStartProvider, BootstrapState, ExitReason
     from .monitor import MonitorEngine
+    from .runtime import bootstrap_path, not_ready_icon_path, ready_icon_path
     from .single_instance import SingleInstanceCoordinator
     from .storage import (
+        effective_storage_preferences,
         load_bootstrap_state,
         load_config,
         resolve_paths,
@@ -48,6 +53,59 @@ else:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _move_aside_invalid_file(path: Path, marker: str) -> Path | None:
+    if not path.exists():
+        return None
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    for index in range(100):
+        suffix = f".{marker}.{timestamp}" if index == 0 else f".{marker}.{timestamp}.{index}"
+        candidate = path.with_name(f"{path.stem}{suffix}{path.suffix}")
+        if candidate.exists():
+            continue
+        try:
+            path.replace(candidate)
+        except OSError:
+            return None
+        return candidate
+    return None
+
+
+def _load_bootstrap_state_with_recovery() -> tuple[BootstrapState, str | None]:
+    try:
+        return load_bootstrap_state(), None
+    except Exception as exc:
+        source_path = bootstrap_path()
+        backup_path = _move_aside_invalid_file(source_path, "invalid")
+        logger.exception("Failed to load bootstrap state from %s", source_path)
+        lines = [
+            f"啟動設定檔讀取失敗：{exc}",
+            "WatchDog 將改用首次啟動流程繼續執行。",
+        ]
+        if backup_path is not None:
+            lines.append(f"原始檔已備份到：{backup_path}")
+        elif source_path.exists():
+            lines.append("原始檔無法自動備份，請手動檢查該檔案。")
+        return BootstrapState(), "\n".join(lines)
+
+
+def _load_config_with_recovery(path: Path) -> tuple[AppConfig, str | None]:
+    try:
+        return load_config(path), None
+    except Exception as exc:
+        backup_path = _move_aside_invalid_file(path, "invalid")
+        logger.exception("Failed to load config from %s", path)
+        lines = [
+            f"設定檔讀取失敗：{exc}",
+            "WatchDog 將改用預設設定繼續執行。",
+        ]
+        if backup_path is not None:
+            lines.append(f"原始檔已備份到：{backup_path}")
+        elif path.exists():
+            lines.append("原始檔無法自動備份，請手動檢查該檔案。")
+        return AppConfig.default(), "\n".join(lines)
 
 
 class TrayActionGuard:
@@ -172,14 +230,19 @@ class AppController(QObject):
     ) -> None:
         super().__init__(app)
         self._app = app
-        self._config = config
+        self._config = self._clone_config(config)
         self._resolved_paths = resolved_paths
         self._single_instance = single_instance
         self._exit_reason: ExitReason | None = None
+        self._fallback_icon = self._build_fallback_icon()
+        self._ready_icon, self._not_ready_icon = self._load_status_icons()
 
         self.monitor_event_signal.connect(self._handle_monitor_event)
-        self._monitor = MonitorEngine(config, event_sink=self.monitor_event_signal.emit)
-        self._window = MainWindow(config, resolved_paths)
+        self._monitor = MonitorEngine(
+            self._clone_config(self._config),
+            event_sink=self.monitor_event_signal.emit,
+        )
+        self._window = MainWindow(self._clone_config(self._config), resolved_paths)
         self._window.config_changed.connect(self.apply_config)
         self._window.manual_launch_requested.connect(self.launch_target)
         self._window.test_requested.connect(self.test_target)
@@ -190,20 +253,22 @@ class AppController(QObject):
         self._tray_action_guard = TrayActionGuard()
         self._tray_menu_visible = False
 
-        self._tray = QSystemTrayIcon(self._build_icon(), self)
+        initial_icon = self._status_icon(False)
+        self._tray = QSystemTrayIcon(initial_icon, self)
         self._tray.setToolTip("WatchDog")
         self._tray.activated.connect(self._handle_tray_activated)
+        self._apply_status_icon(False)
 
         self._tray_menu = LeftClickOnlyMenu(action_guard=self._tray_action_guard)
         self._tray_menu.aboutToShow.connect(self._handle_tray_menu_about_to_show)
         self._tray_menu.aboutToHide.connect(self._handle_tray_menu_about_to_hide)
         self._toggle_action = self._add_guarded_tray_action(
             self._tray_menu,
-            "啟動",
+            "啟動偵測",
             self.toggle_monitoring,
         )
         system_menu = LeftClickOnlyMenu(
-            "系統設計",
+            "系統設定",
             self._tray_menu,
             action_guard=self._tray_action_guard,
         )
@@ -239,6 +304,16 @@ class AppController(QObject):
         self._reload_config_from_disk()
         self.show_settings_window()
 
+    @staticmethod
+    def _clone_config(config: AppConfig) -> AppConfig:
+        return AppConfig.from_dict(config.validate().to_dict())
+
+    def _apply_live_config(self, config: AppConfig) -> None:
+        canonical = self._clone_config(config)
+        self._config = canonical
+        self._monitor.set_config(self._clone_config(canonical))
+        self._window.set_config(self._clone_config(canonical))
+
     def toggle_monitoring(self) -> None:
         if self._monitor.is_running():
             self.stop_monitoring()
@@ -248,12 +323,14 @@ class AppController(QObject):
     def start_monitoring(self) -> None:
         self._monitor.start()
         self._window.set_monitoring_running(True)
-        self._toggle_action.setText("關閉")
+        self._toggle_action.setText("關閉偵測")
+        self._apply_status_icon(True)
 
     def stop_monitoring(self) -> None:
         self._monitor.stop()
         self._window.set_monitoring_running(False)
-        self._toggle_action.setText("啟動")
+        self._toggle_action.setText("啟動偵測")
+        self._apply_status_icon(False)
 
     def launch_target(self, target_id: str) -> None:
         try:
@@ -277,18 +354,76 @@ class AppController(QObject):
             QMessageBox.warning(self._window, "檢查失敗", str(exc))
 
     def apply_config(self, config: AppConfig) -> None:
-        self._config = config.validate()
-        save_config(self._config, self._resolved_paths.config_path)
-        self._monitor.set_config(self._config)
-        self._window.set_config(self._config)
+        previous = self._clone_config(self._config)
+        try:
+            candidate = self._clone_config(config)
+            save_config(candidate, self._resolved_paths.config_path)
+        except Exception as exc:
+            logger.exception("Failed to persist config to %s", self._resolved_paths.config_path)
+            self._apply_live_config(previous)
+            QMessageBox.warning(self._window, "設定儲存失敗", f"無法儲存設定：{exc}")
+            return
+        self._apply_live_config(candidate)
 
     def _reload_config_from_disk(self) -> None:
         if self._window.has_unsaved_changes():
             return
-        config = load_config(self._resolved_paths.config_path)
-        self._config = config.validate()
-        self._monitor.set_config(self._config)
-        self._window.set_config(self._config)
+        config, warning = _load_config_with_recovery(self._resolved_paths.config_path)
+        config.storage = self._config.storage
+        if warning:
+            try:
+                save_config(config, self._resolved_paths.config_path)
+            except Exception as exc:
+                logger.exception("Failed to rewrite recovered config to %s", self._resolved_paths.config_path)
+                warning = f"{warning}\n另外，無法將修復後的設定寫回磁碟：{exc}"
+        self._apply_live_config(config)
+        if warning:
+            QMessageBox.warning(self._window, "設定檔已重設", warning)
+
+    def _rollback_system_settings(
+        self,
+        previous_config: AppConfig,
+        previous_resolved_paths,
+        transient_config_path: Path | None = None,
+    ) -> list[str]:
+        rollback_errors: list[str] = []
+
+        try:
+            apply_autostart(previous_config.auto_start_scope)
+        except Exception as exc:
+            logger.exception("Failed to roll back autostart settings.")
+            rollback_errors.append(f"自動啟動回復失敗：{exc}")
+
+        try:
+            save_config(previous_config, previous_resolved_paths.config_path)
+        except Exception as exc:
+            logger.exception("Failed to roll back config file at %s", previous_resolved_paths.config_path)
+            rollback_errors.append(f"設定檔回復失敗：{exc}")
+
+        if transient_config_path and transient_config_path != previous_resolved_paths.config_path:
+            try:
+                transient_config_path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.exception("Failed to remove staged config file at %s", transient_config_path)
+                rollback_errors.append(f"暫存設定清理失敗：{exc}")
+
+        try:
+            restored_paths = update_bootstrap_for_storage(previous_config.storage)
+        except Exception as exc:
+            logger.exception("Failed to roll back bootstrap storage settings.")
+            restored_paths = previous_resolved_paths
+            rollback_errors.append(f"啟動設定回復失敗：{exc}")
+
+        try:
+            configure_logging(restored_paths.log_directory)
+        except Exception as exc:
+            logger.exception("Failed to roll back logging configuration.")
+            rollback_errors.append(f"日誌設定回復失敗：{exc}")
+
+        self._resolved_paths = restored_paths
+        self._window.set_resolved_paths(restored_paths)
+        self._apply_live_config(previous_config)
+        return rollback_errors
 
     def open_system_settings_dialog(self) -> None:
         dialog = SystemSettingsDialog(
@@ -301,23 +436,40 @@ class AppController(QObject):
         if not dialog.exec():
             return
 
-        storage, scope, start_on_login = dialog.values()
+        requested_storage, scope, start_on_login = dialog.values()
+        previous_config = self._clone_config(self._config)
+        previous_resolved_paths = self._resolved_paths
+        planned_paths = resolve_paths(requested_storage)
+        effective_storage = effective_storage_preferences(planned_paths)
+        candidate = self._clone_config(self._config)
+        candidate.storage = effective_storage
+        candidate.auto_start_scope = scope
+        candidate.start_monitoring_on_login = start_on_login
         try:
             status = apply_autostart(scope)
+            candidate.auto_start_provider = status.provider or AutoStartProvider.NONE
+            save_config(candidate, planned_paths.config_path)
+            resolved = update_bootstrap_for_storage(effective_storage)
+            configure_logging(resolved.log_directory)
         except Exception as exc:
-            QMessageBox.warning(self._window, "系統設定儲存失敗", f"自動啟動設定失敗：{exc}")
+            logger.exception("Failed to persist system settings.")
+            rollback_errors = self._rollback_system_settings(
+                previous_config,
+                previous_resolved_paths,
+                planned_paths.config_path,
+            )
+            message = f"系統設定儲存失敗：{exc}"
+            if rollback_errors:
+                message = f"{message}\n\n已嘗試回復原設定，但以下項目回復失敗：\n" + "\n".join(
+                    rollback_errors
+                )
+            QMessageBox.warning(self._window, "系統設定儲存失敗", message)
             return
 
-        self._config.storage = storage
-        self._config.auto_start_scope = scope
-        self._config.auto_start_provider = status.provider or AutoStartProvider.REGISTRY_RUN
-        self._config.start_monitoring_on_login = start_on_login
-        resolved = update_bootstrap_for_storage(storage)
         self._resolved_paths = resolved
-        configure_logging(resolved.log_directory)
         self._window.set_resolved_paths(resolved)
-        self.apply_config(self._config)
-        if resolved.config_fallback_used or resolved.log_fallback_used:
+        self._apply_live_config(candidate)
+        if effective_storage != requested_storage:
             QMessageBox.warning(
                 self._window,
                 "儲存位置已回退",
@@ -417,10 +569,31 @@ class AppController(QObject):
         }:
             self.show_settings_window()
 
-    def _build_icon(self) -> QIcon:
-        icon = self._app.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
-        if not icon.isNull():
-            return icon
+    def _load_status_icons(self) -> tuple[QIcon, QIcon]:
+        return (
+            self._load_icon(ready_icon_path()),
+            self._load_icon(not_ready_icon_path()),
+        )
+
+    def _load_icon(self, path: Path) -> QIcon:
+        icon = QIcon(str(path))
+        if icon.isNull():
+            logger.warning("Failed to load icon from %s", path)
+        return icon
+
+    def _status_icon(self, monitoring_running: bool) -> QIcon:
+        icon = self._ready_icon if monitoring_running else self._not_ready_icon
+        if icon.isNull():
+            return self._fallback_icon
+        return icon
+
+    def _apply_status_icon(self, monitoring_running: bool) -> None:
+        icon = self._status_icon(monitoring_running)
+        self._tray.setIcon(icon)
+        self._app.setWindowIcon(icon)
+        self._window.setWindowIcon(icon)
+
+    def _build_fallback_icon(self) -> QIcon:
         pixmap = QPixmap(16, 16)
         pixmap.fill(Qt.GlobalColor.darkGreen)
         return QIcon(pixmap)
@@ -459,26 +632,38 @@ def run_child_app() -> int:
     if not single_instance.acquire():
         return ExitReason.SECONDARY_INSTANCE.value
 
-    bootstrap = load_bootstrap_state()
-    if bootstrap.storage is None or not bootstrap.first_run_completed:
-        dialog = StorageSetupDialog()
-        if not dialog.exec():
-            single_instance.close()
-            return ExitReason.USER_EXIT.value
-        selected_storage = dialog.storage_preferences()
-        resolved_paths = update_bootstrap_for_storage(selected_storage)
-    else:
-        selected_storage = bootstrap.storage
-        resolved_paths = resolve_paths(bootstrap.storage)
-
-    configure_logging(resolved_paths.log_directory)
-    old_sys_hook, old_thread_hook = _install_exception_hooks()
     try:
-        config = load_config(resolved_paths.config_path)
+        bootstrap, bootstrap_warning = _load_bootstrap_state_with_recovery()
+        if bootstrap.storage is None or not bootstrap.first_run_completed:
+            dialog = StorageSetupDialog()
+            if not dialog.exec():
+                single_instance.close()
+                return ExitReason.USER_EXIT.value
+            selected_storage = dialog.storage_preferences()
+            resolved_paths = update_bootstrap_for_storage(selected_storage)
+        else:
+            selected_storage = bootstrap.storage
+            resolved_paths = resolve_paths(bootstrap.storage)
+
+        configure_logging(resolved_paths.log_directory)
+        old_sys_hook, old_thread_hook = _install_exception_hooks()
+    except KeyboardInterrupt:
+        return ExitReason.CTRL_C_EXIT.value
+    except Exception:
+        logger.exception("Critical application failure during startup bootstrap.")
+        single_instance.close()
+        return ExitReason.CRITICAL_EXCEPTION.value
+
+    try:
+        config, config_warning = _load_config_with_recovery(resolved_paths.config_path)
         config.storage = selected_storage or config.storage
         save_config(config, resolved_paths.config_path)
         controller = AppController(app, config, resolved_paths, single_instance)
         controller.show_settings_window()
+        if bootstrap_warning:
+            QMessageBox.warning(controller._window, "啟動設定已重設", bootstrap_warning)
+        if config_warning:
+            QMessageBox.warning(controller._window, "設定檔已重設", config_warning)
         app_exit_code = app.exec()
         if controller.exit_reason is not None:
             return controller.exit_reason.value

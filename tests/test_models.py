@@ -131,3 +131,10 @@ def test_boolean_like_strings_are_parsed_correctly_from_config() -> None:
     assert config.minimize_to_tray is False
     assert config.targets[0].enabled is False
     assert config.targets[1].enabled is True
+
+
+def test_app_config_defaults_disabled_provider_to_none() -> None:
+    config = AppConfig.from_dict({})
+
+    assert config.auto_start_scope == AutoStartScope.DISABLED
+    assert config.auto_start_provider == AutoStartProvider.NONE

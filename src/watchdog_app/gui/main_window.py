@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 from pathlib import Path
 import shlex
 import subprocess
@@ -93,6 +94,30 @@ TABLE_CONTROL_MARGIN = 40
 TABLE_CONTROL_WIDTH = 32
 TABLE_CONTROL_BUTTON_SIZE = 24
 TABLE_CONTROL_BUTTON_SPACING = 8
+
+
+def _parse_windows_command_args(command_text: str) -> list[str]:
+    stripped = command_text.strip()
+    if not stripped:
+        return []
+
+    if hasattr(ctypes, "windll"):
+        argc = ctypes.c_int()
+        command_line = f"watchdog.exe {stripped}"
+        command_line_to_argv = ctypes.windll.shell32.CommandLineToArgvW
+        command_line_to_argv.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int)]
+        command_line_to_argv.restype = ctypes.POINTER(ctypes.c_wchar_p)
+        local_free = ctypes.windll.kernel32.LocalFree
+        local_free.argtypes = [ctypes.c_void_p]
+        local_free.restype = ctypes.c_void_p
+        argv = command_line_to_argv(command_line, ctypes.byref(argc))
+        if argv:
+            try:
+                return [argv[index] for index in range(argc.value)][1:]
+            finally:
+                local_free(argv)
+
+    return shlex.split(stripped, posix=False)
 
 
 class CenteredCheckboxCell(QWidget):
@@ -765,9 +790,7 @@ class MainWindow(QMainWindow):
             enabled=self._current_target_enabled if self._current_target_id else False,
             launch=LaunchSpec(
                 path=self._path_edit.text(),
-                args=shlex.split(self._args_edit.text(), posix=False)
-                if self._args_edit.text().strip()
-                else [],
+                args=_parse_windows_command_args(self._args_edit.text()),
                 working_dir=self._working_dir_edit.text(),
                 kind=self._kind_combo.currentData(),
             ),

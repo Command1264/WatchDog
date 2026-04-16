@@ -243,6 +243,40 @@ def test_left_table_checkbox_toggles_when_clicking_enabled_cell(qtbot, tmp_path)
     assert enabled_widget.is_checked() is True
 
 
+def test_main_window_preserves_complex_windows_arguments_round_trip(qtbot, tmp_path) -> None:
+    original_args = [
+        '--json={"path":"C:\\\\Temp Folder\\\\file.txt"}',
+        'plain value',
+        'quote "inside"',
+    ]
+    config = AppConfig(
+        targets=[
+            TargetConfig(
+                id="alpha",
+                name="Alpha",
+                enabled=True,
+                launch=LaunchSpec(path="C:/demo.exe", args=original_args, kind=LaunchKind.EXE),
+                checks=[CheckSpec(type=CheckType.RUNTIME_PID)],
+            ).validate()
+        ]
+    ).validate()
+    window = MainWindow(
+        config,
+        ResolvedPaths(
+            bootstrap_path=tmp_path / "bootstrap.json",
+            config_path=tmp_path / "config.json",
+            log_directory=tmp_path / "logs",
+        ),
+    )
+    qtbot.addWidget(window)
+
+    window._targets_table.selectRow(0)
+    window._load_selected_target()
+    collected = window._collect_target()
+
+    assert collected.launch.args == original_args
+
+
 def test_existing_targets_are_loaded_into_editor_on_startup(qtbot, tmp_path) -> None:
     config = AppConfig(
         targets=[

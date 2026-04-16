@@ -70,6 +70,7 @@ class MonitorEngine:
             for target in self._config.targets
         }
         self._startup_index = 0
+        self._startup_queue: list[str] = []
         self._next_start_at = 0.0
 
     @property
@@ -91,28 +92,51 @@ class MonitorEngine:
 
     def set_config(self, config: AppConfig) -> None:
         with self._lock:
+            previous_config = self._config
+            previous_queue_head = self._startup_queue[0] if self._startup_queue else None
             self._config = config.validate()
+            previous_states = self._states
+            updated_states: dict[str, TargetRuntimeState] = {}
+            previous_enabled = {target.id: target.enabled for target in previous_config.targets}
             for target in self._config.targets:
-                self._states.setdefault(
-                    target.id,
-                    TargetRuntimeState(
+                state = previous_states.get(target.id)
+                if state is None:
+                    state = TargetRuntimeState(
                         status=TargetStatus.STOPPED if target.enabled else TargetStatus.DISABLED
-                    ),
-                )
+                    )
+                elif not target.enabled:
+                    state.status = TargetStatus.DISABLED
+                elif state.status == TargetStatus.DISABLED:
+                    state.status = TargetStatus.STOPPED
+                updated_states[target.id] = state
+            self._states = updated_states
+            valid_target_ids = set(updated_states)
+            self._startup_queue = [target_id for target_id in self._startup_queue if target_id in valid_target_ids]
+            if self._running:
+                queued_ids = set(self._startup_queue)
+                for target in self._config.targets:
+                    if target.enabled and not previous_enabled.get(target.id, False) and target.id not in queued_ids:
+                        self._startup_queue.append(target.id)
+                        queued_ids.add(target.id)
+                if (self._startup_queue[0] if self._startup_queue else None) != previous_queue_head:
+                    self._next_start_at = 0.0
+                self._sync_startup_schedule_locked(self._time())
+            else:
+                self._startup_pending = False
+                self._next_start_at = 0.0
 
     def is_running(self) -> bool:
-        return self._running
+        with self._lock:
+            return self._running
 
     def start(self) -> None:
         with self._lock:
             if self._running:
                 return
             self._running = True
-            self._startup_pending = True
             self._startup_index = 0
-            enabled_targets = self._enabled_targets()
-            initial_delay = enabled_targets[0].startup_delay_sec if enabled_targets else 0.0
-            self._next_start_at = self._time() + initial_delay
+            self._startup_queue = [target.id for target in self._config.targets if target.enabled]
+            self._sync_startup_schedule_locked(self._time())
             self._stop_event.clear()
             if self._thread is None or not self._thread.is_alive():
                 self._thread = threading.Thread(
@@ -127,6 +151,8 @@ class MonitorEngine:
         with self._lock:
             self._running = False
             self._startup_pending = False
+            self._startup_queue = []
+            self._next_start_at = 0.0
             for target in self._config.targets:
                 state = self._states[target.id]
                 state.status = TargetStatus.STOPPED if target.enabled else TargetStatus.DISABLED
@@ -145,7 +171,9 @@ class MonitorEngine:
         result = launch_process(target.launch)
         now = self._time()
         with self._lock:
-            state = self._states[target.id]
+            state = self._states.get(target.id)
+            if state is None:
+                raise KeyError(target.id)
             state.runtime_pid = result.pid
             state.last_restart_at = self._wall_time()
             state.last_restart_monotonic = now
@@ -157,9 +185,16 @@ class MonitorEngine:
 
     def test_target(self, target_id: str) -> AggregatedCheckResult:
         target = self._target_by_id(target_id)
-        state = self._states[target.id]
-        result = evaluate_target(target, CheckContext(runtime_pid=state.runtime_pid))
         with self._lock:
+            state = self._states.get(target.id)
+            if state is None:
+                raise KeyError(target.id)
+            runtime_pid = state.runtime_pid
+        result = evaluate_target(target, CheckContext(runtime_pid=runtime_pid))
+        with self._lock:
+            state = self._states.get(target.id)
+            if state is None:
+                raise KeyError(target.id)
             state.last_check_at = self._wall_time()
             state.status = TargetStatus.RUNNING if result.healthy else TargetStatus.UNHEALTHY
             if result.healthy:
@@ -183,21 +218,24 @@ class MonitorEngine:
             self._stop_event.wait(self._sleep_interval)
 
     def _handle_start_sequence(self, now: float, now_wall: float) -> None:
-        if not self._startup_pending or now < self._next_start_at:
-            return
+        with self._lock:
+            if not self._startup_pending or now < self._next_start_at:
+                return
 
-        enabled_targets = self._enabled_targets()
-        if self._startup_index >= len(enabled_targets):
-            self._startup_pending = False
+            target = None
+            while self._startup_queue:
+                candidate_id = self._startup_queue.pop(0)
+                candidate = next(
+                    (item for item in self._config.targets if item.id == candidate_id and item.enabled),
+                    None,
+                )
+                if candidate is not None:
+                    target = candidate
+                    break
             self._next_start_at = 0.0
-            return
-
-        target = enabled_targets[self._startup_index]
-        self._startup_index += 1
-        if self._startup_index < len(enabled_targets):
-            self._next_start_at = now + enabled_targets[self._startup_index].startup_delay_sec
-        else:
-            self._next_start_at = 0.0
+            self._sync_startup_schedule_locked(now)
+            if target is None:
+                return
 
         startup_health = self._startup_check_passes(target, now, now_wall)
         if startup_health is True:
@@ -206,13 +244,20 @@ class MonitorEngine:
             return
 
         with self._lock:
-            self._states[target.id].status = TargetStatus.SCHEDULED
+            state = self._states.get(target.id)
+            if state is None:
+                return
+            state.status = TargetStatus.SCHEDULED
         self._launch_target(target, now, now_wall, "排程啟動")
 
     def _startup_check_passes(self, target, now: float, now_wall: float) -> bool | None:
-        state = self._states[target.id]
+        with self._lock:
+            state = self._states.get(target.id)
+            if state is None:
+                return None
+            runtime_pid = state.runtime_pid
         try:
-            result = evaluate_target(target, CheckContext(runtime_pid=state.runtime_pid))
+            result = evaluate_target(target, CheckContext(runtime_pid=runtime_pid))
         except (ConfigValidationError, OSError) as exc:
             self._record_error(target.id, str(exc))
             return None
@@ -220,53 +265,74 @@ class MonitorEngine:
             self._record_error(target.id, f"{type(exc).__name__}: {exc}")
             return None
 
-        state.last_check_at = now_wall
-        state.next_check_at = now + target.check_interval_sec
-        if not result.healthy:
-            state.last_error, state.last_error_detail = self._summarize_check_failure(result)
-            return False
+        with self._lock:
+            state = self._states.get(target.id)
+            if state is None:
+                return None
+            state.last_check_at = now_wall
+            state.next_check_at = now + target.check_interval_sec
+            if not result.healthy:
+                state.last_error, state.last_error_detail = self._summarize_check_failure(result)
+                return False
 
-        state.status = TargetStatus.RUNNING
-        state.last_error = ""
-        state.last_error_detail = ""
+            state.status = TargetStatus.RUNNING
+            state.last_error = ""
+            state.last_error_detail = ""
         self._emit(target.id, state.status, "啟動時檢查通過，略過啟動。")
         return True
 
     def _check_targets(self, now: float, now_wall: float) -> None:
-        for target in self._config.targets:
-            state = self._states[target.id]
-            if not target.enabled:
-                state.status = TargetStatus.DISABLED
-                continue
-            if self._startup_pending and state.status in {
-                TargetStatus.STOPPED,
-                TargetStatus.SCHEDULED,
-            }:
-                continue
-            if state.next_check_at and state.next_check_at > now:
-                continue
+        with self._lock:
+            targets = list(self._config.targets)
+
+        for target in targets:
+            with self._lock:
+                state = self._states.get(target.id)
+                startup_pending = self._startup_pending
+                if state is None:
+                    continue
+                if not target.enabled:
+                    state.status = TargetStatus.DISABLED
+                    continue
+                if startup_pending and state.status in {
+                    TargetStatus.STOPPED,
+                    TargetStatus.SCHEDULED,
+                }:
+                    continue
+                if state.next_check_at and state.next_check_at > now:
+                    continue
+                runtime_pid = state.runtime_pid
 
             try:
-                result = evaluate_target(target, CheckContext(runtime_pid=state.runtime_pid))
-                state.last_check_at = now_wall
-                state.next_check_at = now + target.check_interval_sec
-                if result.healthy:
-                    state.status = TargetStatus.RUNNING
-                    state.last_error = ""
-                    state.last_error_detail = ""
-                    self._emit(target.id, state.status, result.summary)
-                    continue
-
-                if state.status == TargetStatus.ERROR:
-                    self._emit(target.id, state.status, result.summary)
-                else:
-                    state.status = TargetStatus.UNHEALTHY
-                    state.last_error, state.last_error_detail = self._summarize_check_failure(result)
-                    self._emit(target.id, state.status, result.summary)
-                if (
-                    not state.last_restart_monotonic
-                    or (now - state.last_restart_monotonic) >= target.restart_cooldown_sec
-                ):
+                result = evaluate_target(target, CheckContext(runtime_pid=runtime_pid))
+                emit_status: TargetStatus | None = None
+                should_launch = False
+                with self._lock:
+                    state = self._states.get(target.id)
+                    if state is None:
+                        continue
+                    state.last_check_at = now_wall
+                    state.next_check_at = now + target.check_interval_sec
+                    if result.healthy:
+                        state.status = TargetStatus.RUNNING
+                        state.last_error = ""
+                        state.last_error_detail = ""
+                        emit_status = state.status
+                    else:
+                        if state.status != TargetStatus.ERROR:
+                            state.status = TargetStatus.UNHEALTHY
+                            state.last_error, state.last_error_detail = self._summarize_check_failure(result)
+                        emit_status = state.status
+                        should_launch = (
+                            state.status != TargetStatus.ERROR
+                            and (
+                                not state.last_restart_monotonic
+                                or (now - state.last_restart_monotonic) >= target.restart_cooldown_sec
+                            )
+                        )
+                if emit_status is not None:
+                    self._emit(target.id, emit_status, result.summary)
+                if should_launch:
                     self._launch_target(target, now, now_wall, "自動重新啟動")
             except (ConfigValidationError, OSError) as exc:
                 self._record_error(target.id, str(exc))
@@ -274,30 +340,41 @@ class MonitorEngine:
                 self._record_error(target.id, f"{type(exc).__name__}: {exc}")
 
     def _launch_target(self, target, now: float, now_wall: float, message: str) -> None:
+        with self._lock:
+            if target.id not in self._states:
+                return
         self._emit(target.id, TargetStatus.LAUNCHING, message)
         try:
             result = launch_process(target.launch)
         except (ConfigValidationError, OSError) as exc:
-            state = self._states[target.id]
-            state.last_restart_monotonic = now
-            state.next_check_at = now + target.check_interval_sec
+            with self._lock:
+                state = self._states.get(target.id)
+                if state is None:
+                    return
+                state.last_restart_monotonic = now
+                state.next_check_at = now + target.check_interval_sec
             self._record_error(target.id, str(exc))
             return
 
-        state = self._states[target.id]
-        state.runtime_pid = result.pid
-        state.last_restart_at = now_wall
-        state.last_restart_monotonic = now
-        state.next_check_at = now + target.check_interval_sec
-        state.status = TargetStatus.RUNNING
-        state.last_error = ""
-        state.last_error_detail = ""
+        with self._lock:
+            state = self._states.get(target.id)
+            if state is None:
+                return
+            state.runtime_pid = result.pid
+            state.last_restart_at = now_wall
+            state.last_restart_monotonic = now
+            state.next_check_at = now + target.check_interval_sec
+            state.status = TargetStatus.RUNNING
+            state.last_error = ""
+            state.last_error_detail = ""
         self._emit(target.id, state.status, f"{message}：PID={result.pid}")
 
     def _record_error(self, target_id: str, message: str) -> None:
         logger.exception("Target %s operation failed: %s", target_id, message)
         with self._lock:
-            state = self._states[target_id]
+            state = self._states.get(target_id)
+            if state is None:
+                return
             state.status = TargetStatus.ERROR
             state.last_error = self._summarize_text(message)
             state.last_error_detail = message
@@ -340,10 +417,41 @@ class MonitorEngine:
         )
 
     def _target_by_id(self, target_id: str):
-        for target in self._config.targets:
-            if target.id == target_id:
-                return target
+        with self._lock:
+            for target in self._config.targets:
+                if target.id == target_id:
+                    return target
         raise KeyError(target_id)
 
     def _enabled_targets(self):
-        return [target for target in self._config.targets if target.enabled]
+        with self._lock:
+            return [target for target in self._config.targets if target.enabled]
+
+    def _sync_startup_schedule_locked(self, now: float) -> None:
+        if not self._running:
+            self._startup_pending = False
+            self._next_start_at = 0.0
+            return
+
+        self._startup_queue = [
+            target_id
+            for target_id in self._startup_queue
+            if any(target.id == target_id and target.enabled for target in self._config.targets)
+        ]
+        if not self._startup_queue:
+            self._startup_pending = False
+            self._next_start_at = 0.0
+            return
+
+        first_target = next(
+            (target for target in self._config.targets if target.id == self._startup_queue[0]),
+            None,
+        )
+        if first_target is None:
+            self._startup_queue.pop(0)
+            self._sync_startup_schedule_locked(now)
+            return
+
+        if not self._startup_pending or self._next_start_at == 0.0:
+            self._startup_pending = True
+            self._next_start_at = now + first_target.startup_delay_sec

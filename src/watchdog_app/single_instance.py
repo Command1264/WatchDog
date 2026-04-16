@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 from .models import APP_NAME
+from .runtime import runtime_base_dir
 
 
 class SingleInstanceCoordinator(QObject):
@@ -11,7 +14,9 @@ class SingleInstanceCoordinator(QObject):
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
-        self._server_name = f"{APP_NAME}_PrimaryInstance"
+        namespace = str(runtime_base_dir().resolve()).casefold()
+        suffix = hashlib.sha1(namespace.encode("utf-8")).hexdigest()[:12]
+        self._server_name = f"{APP_NAME}_PrimaryInstance_{suffix}"
         self._server: QLocalServer | None = None
 
     def acquire(self) -> bool:

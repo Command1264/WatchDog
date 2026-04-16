@@ -9,6 +9,8 @@ if (-not (Test-Path $python)) {
 
 Push-Location $root
 try {
+    $iconPath = Join-Path $root "src\watchdog_app\assets\icons\WatchDog.ico"
+    $iconDataDir = Join-Path $root "src\watchdog_app\assets\icons"
     & $python -m pip install pyinstaller
     & $python -m PyInstaller `
         --noconfirm `
@@ -16,6 +18,8 @@ try {
         --onefile `
         --windowed `
         --name WatchDog `
+        --icon $iconPath `
+        --add-data "${iconDataDir};watchdog_app/assets/icons" `
         --paths src `
         src\watchdog_app\main.py
 }

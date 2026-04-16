@@ -24,6 +24,26 @@ def runtime_base_dir() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def package_dir() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def asset_path(*parts: str) -> Path:
+    return package_dir().joinpath("assets", *parts)
+
+
+def app_icon_path() -> Path:
+    return asset_path("icons", "WatchDog.ico")
+
+
+def ready_icon_path() -> Path:
+    return asset_path("icons", "WatchDog-Ready.ico")
+
+
+def not_ready_icon_path() -> Path:
+    return asset_path("icons", "WatchDog-NotReady.ico")
+
+
 def appdata_dir() -> Path:
     return Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / APP_NAME
 

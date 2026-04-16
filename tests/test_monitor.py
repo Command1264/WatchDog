@@ -164,3 +164,153 @@ def test_startup_skips_launch_when_existing_target_is_already_healthy(monkeypatc
         assert state.next_check_at == 15.3
     finally:
         engine.shutdown()
+
+
+def test_set_config_drops_runtime_states_for_removed_targets() -> None:
+    engine = MonitorEngine(
+        AppConfig(
+            targets=[
+                TargetConfig(
+                    id="alpha",
+                    name="Alpha",
+                    enabled=True,
+                    launch=LaunchSpec(path="C:/alpha.exe", kind=LaunchKind.EXE, working_dir="C:/"),
+                    checks=[CheckSpec(type=CheckType.RUNTIME_PID)],
+                ).validate(),
+                TargetConfig(
+                    id="beta",
+                    name="Beta",
+                    enabled=True,
+                    launch=LaunchSpec(path="C:/beta.exe", kind=LaunchKind.EXE, working_dir="C:/"),
+                    checks=[CheckSpec(type=CheckType.RUNTIME_PID)],
+                ).validate(),
+            ]
+        ).validate()
+    )
+
+    engine.set_config(
+        AppConfig(
+            targets=[
+                TargetConfig(
+                    id="beta",
+                    name="Beta",
+                    enabled=True,
+                    launch=LaunchSpec(path="C:/beta.exe", kind=LaunchKind.EXE, working_dir="C:/"),
+                    checks=[CheckSpec(type=CheckType.RUNTIME_PID)],
+                ).validate()
+            ]
+        ).validate()
+    )
+
+    assert set(engine.states) == {"beta"}
+
+
+def test_handle_start_sequence_skips_targets_missing_from_runtime_states(monkeypatch) -> None:
+    target = TargetConfig(
+        id="alpha",
+        name="Alpha",
+        enabled=True,
+        launch=LaunchSpec(path="C:/alpha.exe", kind=LaunchKind.EXE, working_dir="C:/"),
+        startup_delay_sec=0.05,
+        check_interval_sec=0.1,
+        restart_cooldown_sec=0.1,
+        checks=[CheckSpec(type=CheckType.RUNTIME_PID)],
+    ).validate()
+    engine = MonitorEngine(AppConfig(targets=[target]).validate())
+    engine._startup_pending = True
+    engine._startup_index = 0
+    engine._next_start_at = 0.0
+    engine._states = {}
+
+    monkeypatch.setattr(
+        "watchdog_app.monitor.evaluate_target",
+        lambda target, context: AggregatedCheckResult(
+            healthy=False,
+            check_results=[CheckResult(False, "PID 檢查", "程序不存在。")],
+            summary="檢查失敗",
+        ),
+    )
+
+    engine._handle_start_sequence(1.0, 1.0)
+
+    assert engine.states == {}
+
+
+def test_check_targets_skips_targets_missing_from_runtime_states(monkeypatch) -> None:
+    target = TargetConfig(
+        id="alpha",
+        name="Alpha",
+        enabled=True,
+        launch=LaunchSpec(path="C:/alpha.exe", kind=LaunchKind.EXE, working_dir="C:/"),
+        startup_delay_sec=0.05,
+        check_interval_sec=0.1,
+        restart_cooldown_sec=0.1,
+        checks=[CheckSpec(type=CheckType.RUNTIME_PID)],
+    ).validate()
+    engine = MonitorEngine(AppConfig(targets=[target]).validate())
+    engine._states = {}
+
+    monkeypatch.setattr(
+        "watchdog_app.monitor.evaluate_target",
+        lambda target, context: AggregatedCheckResult(
+            healthy=True,
+            check_results=[CheckResult(True, "PID 檢查", "程序存在。")],
+            summary="檢查通過",
+        ),
+    )
+
+    engine._check_targets(1.0, 1.0)
+
+    assert engine.states == {}
+
+
+def test_set_config_while_running_respects_startup_delay_for_new_target(monkeypatch) -> None:
+    launches: list[str] = []
+    clock = {"now": 10.0}
+
+    def _fake_launch(launch: LaunchSpec) -> LaunchResult:
+        launches.append(launch.path)
+        return LaunchResult(pid=4321, command=[launch.path], working_dir="C:/")
+
+    monkeypatch.setattr("watchdog_app.monitor.launch_process", _fake_launch)
+    monkeypatch.setattr(
+        "watchdog_app.monitor.evaluate_target",
+        lambda target, context: AggregatedCheckResult(
+            healthy=False,
+            check_results=[CheckResult(False, "PID 檢查", "程序不存在。")],
+            summary="檢查失敗",
+        ),
+    )
+
+    engine = MonitorEngine(
+        AppConfig(targets=[]).validate(),
+        time_provider=lambda: clock["now"],
+        wall_time_provider=lambda: 1000.0,
+        sleep_interval=0.01,
+    )
+    engine.start()
+    try:
+        delayed = TargetConfig(
+            id="dynamic",
+            name="Dynamic",
+            enabled=True,
+            launch=LaunchSpec(path="C:/dynamic.exe", kind=LaunchKind.EXE, working_dir="C:/"),
+            startup_delay_sec=1.0,
+            check_interval_sec=5.0,
+            restart_cooldown_sec=5.0,
+            checks=[CheckSpec(type=CheckType.RUNTIME_PID)],
+        ).validate()
+
+        engine.set_config(AppConfig(targets=[delayed]).validate())
+        time.sleep(0.05)
+        assert launches == []
+
+        clock["now"] = 10.8
+        time.sleep(0.05)
+        assert launches == []
+
+        clock["now"] = 11.1
+        time.sleep(0.05)
+        assert launches == ["C:/dynamic.exe"]
+    finally:
+        engine.shutdown()

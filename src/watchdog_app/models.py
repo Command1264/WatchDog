@@ -73,6 +73,7 @@ class AutoStartScope(str, Enum):
 
 
 class AutoStartProvider(str, Enum):
+    NONE = "none"
     REGISTRY_RUN = "registry_run"
     SCHEDULED_TASK = "scheduled_task"
 
@@ -336,7 +337,7 @@ class StoragePreferences:
 class AppConfig:
     storage: StoragePreferences = field(default_factory=StoragePreferences)
     auto_start_scope: AutoStartScope = AutoStartScope.DISABLED
-    auto_start_provider: AutoStartProvider = AutoStartProvider.REGISTRY_RUN
+    auto_start_provider: AutoStartProvider = AutoStartProvider.NONE
     start_monitoring_on_login: bool = False
     minimize_to_tray: bool = True
     targets: list[TargetConfig] = field(default_factory=list)
@@ -372,7 +373,7 @@ class AppConfig:
                 str(data.get("auto_start_scope", AutoStartScope.DISABLED.value))
             ),
             auto_start_provider=AutoStartProvider(
-                str(data.get("auto_start_provider", AutoStartProvider.REGISTRY_RUN.value))
+                str(data.get("auto_start_provider", AutoStartProvider.NONE.value))
             ),
             start_monitoring_on_login=_coerce_bool(
                 data.get("start_monitoring_on_login"),
