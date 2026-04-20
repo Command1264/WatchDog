@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import time
 
@@ -28,7 +29,7 @@ class Supervisor:
         while True:
             command = [*child_command(), *self._child_args]
             logger.info("Launching child app: %s", command)
-            completed = subprocess.run(command, check=False)  # noqa: S603
+            completed = subprocess.run(command, **self._child_run_kwargs())  # noqa: S603
             reason = ExitReason.from_exit_code(completed.returncode)
 
             if reason in NON_RESTART_REASONS:
@@ -43,3 +44,22 @@ class Supervisor:
             )
             time.sleep(backoff_seconds)
             backoff_seconds = min(backoff_seconds * 2.0, 30.0)
+
+    @staticmethod
+    def _child_run_kwargs() -> dict[str, object]:
+        kwargs: dict[str, object] = {"check": False}
+        if os.name != "nt":
+            return kwargs
+
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        startupinfo_factory = getattr(subprocess, "STARTUPINFO", None)
+        startf_use_show_window = getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+
+        if startupinfo_factory is not None:
+            startupinfo = startupinfo_factory()
+            startupinfo.dwFlags |= startf_use_show_window
+            startupinfo.wShowWindow = 0
+            kwargs["startupinfo"] = startupinfo
+        if creationflags:
+            kwargs["creationflags"] = creationflags
+        return kwargs
