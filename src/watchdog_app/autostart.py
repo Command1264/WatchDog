@@ -113,18 +113,20 @@ def registry_command(scope: AutoStartScope | str) -> str | None:
             value, _ = winreg.QueryValueEx(handle, APP_NAME)
             command = str(value)
             normalized = normalize_separators(command)
-            if normalized != command:
+            desired = startup_command_line()
+            rewritten = desired if normalized != desired else normalized
+            if rewritten != command:
                 try:
                     with winreg.CreateKeyEx(hive, RUN_KEY, 0, access=winreg.KEY_SET_VALUE) as writable:
-                        winreg.SetValueEx(writable, APP_NAME, 0, winreg.REG_SZ, normalized)
-                    logger.info("Normalized autostart registry path separators. scope=%s", scope.value)
+                        winreg.SetValueEx(writable, APP_NAME, 0, winreg.REG_SZ, rewritten)
+                    logger.info("Updated autostart registry command. scope=%s", scope.value)
                 except OSError as exc:
                     logger.warning(
-                        "Failed to rewrite legacy autostart registry value. scope=%s error=%s",
+                        "Failed to rewrite legacy autostart registry command. scope=%s error=%s",
                         scope.value,
                         exc,
                     )
-            return normalized
+            return rewritten
     except FileNotFoundError:
         return None
     except OSError:

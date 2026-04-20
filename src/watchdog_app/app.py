@@ -17,11 +17,11 @@ from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-    from watchdog_app.autostart import apply_autostart
+    from watchdog_app.autostart import apply_autostart, detect_autostart
     from watchdog_app.gui.dialogs import StorageSetupDialog, SystemSettingsDialog
     from watchdog_app.gui.main_window import MainWindow
     from watchdog_app.logging_utils import configure_logging
-    from watchdog_app.models import AppConfig, AutoStartProvider, BootstrapState, ExitReason
+    from watchdog_app.models import AppConfig, AutoStartProvider, AutoStartScope, BootstrapState, ExitReason
     from watchdog_app.monitor import MonitorEngine
     from watchdog_app.runtime import bootstrap_path, not_ready_icon_path, ready_icon_path
     from watchdog_app.single_instance import SingleInstanceCoordinator
@@ -35,11 +35,11 @@ if __package__ in {None, ""}:
         update_bootstrap_for_storage,
     )
 else:
-    from .autostart import apply_autostart
+    from .autostart import apply_autostart, detect_autostart
     from .gui.dialogs import StorageSetupDialog, SystemSettingsDialog
     from .gui.main_window import MainWindow
     from .logging_utils import configure_logging
-    from .models import AppConfig, AutoStartProvider, BootstrapState, ExitReason
+    from .models import AppConfig, AutoStartProvider, AutoStartScope, BootstrapState, ExitReason
     from .monitor import MonitorEngine
     from .runtime import bootstrap_path, not_ready_icon_path, ready_icon_path
     from .single_instance import SingleInstanceCoordinator
@@ -294,6 +294,7 @@ class AppController(QObject):
 
         self._app.commitDataRequest.connect(self._handle_session_end)
         self._app.aboutToQuit.connect(self._about_to_quit)
+        self._reconcile_autostart_entry()
 
         if self._config.start_monitoring_on_login:
             self.start_monitoring()
@@ -301,6 +302,25 @@ class AppController(QObject):
     @property
     def exit_reason(self) -> ExitReason | None:
         return self._exit_reason
+
+    def _reconcile_autostart_entry(self) -> None:
+        if self._config.auto_start_scope == AutoStartScope.DISABLED:
+            return
+        try:
+            status = detect_autostart(self._config.auto_start_scope)
+        except Exception as exc:
+            logger.warning(
+                "Failed to reconcile autostart entry on startup. scope=%s error=%s",
+                self._config.auto_start_scope.value,
+                exc,
+            )
+            return
+        logger.debug(
+            "Autostart reconciliation completed. scope=%s enabled=%s provider=%s",
+            status.scope.value,
+            status.enabled,
+            status.provider.value if status.provider else "none",
+        )
 
     def eventFilter(self, watched, event):  # type: ignore[override]
         if watched is self._window and event.type() == QEvent.Type.Close:

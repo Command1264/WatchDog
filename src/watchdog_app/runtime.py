@@ -78,10 +78,26 @@ def child_command() -> list[str]:
     return [normalize_path_text(sys.executable), "-m", "watchdog_app.main", "--child-app"]
 
 
+def startup_host_executable() -> str:
+    if is_frozen():
+        return normalize_path_text(executable_path())
+
+    executable = Path(sys.executable).resolve()
+    if executable.name.casefold() == "pythonw.exe":
+        return normalize_path_text(executable)
+
+    if executable.name.casefold() == "python.exe":
+        windowless = executable.with_name("pythonw.exe")
+        if windowless.exists():
+            return normalize_path_text(windowless)
+
+    return normalize_path_text(executable)
+
+
 def startup_command() -> list[str]:
     if is_frozen():
         return [normalize_path_text(executable_path())]
-    return [normalize_path_text(sys.executable), "-m", "watchdog_app.main"]
+    return [startup_host_executable(), "-m", "watchdog_app.main"]
 
 
 def startup_command_line() -> str:

@@ -236,6 +236,7 @@ def test_registry_command_normalizes_legacy_backslashes_and_writes_back(monkeypa
 
     monkeypatch.setattr(autostart.winreg, "OpenKey", lambda *args, **kwargs: _Handle())
     monkeypatch.setattr(autostart.winreg, "CreateKeyEx", lambda *args, **kwargs: _Handle())
+    monkeypatch.setattr(autostart, "startup_command_line", lambda: '"C:/Watch Dog/WatchDog.exe"')
     monkeypatch.setattr(
         autostart.winreg,
         "QueryValueEx",
@@ -252,3 +253,38 @@ def test_registry_command_normalizes_legacy_backslashes_and_writes_back(monkeypa
     assert command == '"C:/Watch Dog/WatchDog.exe"'
     assert writes
     assert writes[0][-1] == '"C:/Watch Dog/WatchDog.exe"'
+
+
+def test_registry_command_rewrites_legacy_python_console_host(monkeypatch: object) -> None:
+    writes: list[tuple[object, str, int, object, str]] = []
+
+    class _Handle:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    monkeypatch.setattr(autostart.winreg, "OpenKey", lambda *args, **kwargs: _Handle())
+    monkeypatch.setattr(autostart.winreg, "CreateKeyEx", lambda *args, **kwargs: _Handle())
+    monkeypatch.setattr(
+        autostart,
+        "startup_command_line",
+        lambda: '"C:/venv/Scripts/pythonw.exe" -m watchdog_app.main',
+    )
+    monkeypatch.setattr(
+        autostart.winreg,
+        "QueryValueEx",
+        lambda *_args, **_kwargs: ('"C:/venv/Scripts/python.exe" -m watchdog_app.main', autostart.winreg.REG_SZ),
+    )
+    monkeypatch.setattr(
+        autostart.winreg,
+        "SetValueEx",
+        lambda *args: writes.append(args),
+    )
+
+    command = autostart.registry_command(AutoStartScope.CURRENT_USER)
+
+    assert command == '"C:/venv/Scripts/pythonw.exe" -m watchdog_app.main'
+    assert writes
+    assert writes[0][-1] == '"C:/venv/Scripts/pythonw.exe" -m watchdog_app.main'

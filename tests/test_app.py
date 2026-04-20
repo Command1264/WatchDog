@@ -245,6 +245,48 @@ def test_app_controller_uses_manual_tray_menu_popup_for_context(monkeypatch, qtb
     assert events == ["menu", "window"]
 
 
+def test_app_controller_reconciles_enabled_autostart_on_startup(monkeypatch, qtbot, tmp_path) -> None:
+    app = QApplication.instance()
+    assert app is not None
+
+    monkeypatch.setattr("watchdog_app.app.MonitorEngine", DummyMonitorEngine)
+    monkeypatch.setattr("watchdog_app.app.MainWindow", DummyMainWindow)
+    monkeypatch.setattr("watchdog_app.app.QSystemTrayIcon", DummyTrayIcon)
+    monkeypatch.setattr(
+        "watchdog_app.app.AppController._load_status_icons",
+        lambda self: (_solid_icon(Qt.GlobalColor.green), _solid_icon(Qt.GlobalColor.red)),
+    )
+
+    calls: list[AutoStartScope] = []
+
+    def _detect(scope: AutoStartScope) -> AutoStartStatus:
+        calls.append(scope)
+        return AutoStartStatus(
+            scope=scope,
+            provider=AutoStartProvider.REGISTRY_RUN,
+            enabled=True,
+        )
+
+    monkeypatch.setattr("watchdog_app.app.detect_autostart", _detect)
+
+    controller = AppController(
+        app,
+        AppConfig(
+            auto_start_scope=AutoStartScope.CURRENT_USER,
+            auto_start_provider=AutoStartProvider.REGISTRY_RUN,
+        ).validate(),
+        ResolvedPaths(
+            bootstrap_path=tmp_path / "bootstrap.json",
+            config_path=tmp_path / "config.json",
+            log_directory=tmp_path / "logs",
+        ),
+        DummySingleInstance(),
+    )
+    qtbot.addWidget(controller._window)
+
+    assert calls == [AutoStartScope.CURRENT_USER]
+
+
 def test_tray_action_is_blocked_without_valid_left_click_token(monkeypatch, qtbot, tmp_path) -> None:
     app = QApplication.instance()
     assert app is not None
