@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 import sys
 
 import pytest
@@ -24,6 +25,7 @@ from watchdog_app.models import (
     BootstrapState,
     ExitReason,
     ResolvedPaths,
+    StorageMode,
     StoragePreferences,
 )
 
@@ -148,6 +150,20 @@ class DummyChangingSystemSettingsDialog(DummySystemSettingsDialog):
             StoragePreferences(config_mode="exe", log_mode="exe"),
             AutoStartScope.CURRENT_USER,
             True,
+        )
+
+
+class DummyCustomStorageSystemSettingsDialog(DummySystemSettingsDialog):
+    def values(self) -> tuple[StoragePreferences, AutoStartScope, bool]:
+        return (
+            StoragePreferences(
+                config_mode="custom",
+                log_mode="custom",
+                config_custom_path="D:/CustomConfig",
+                log_custom_path="E:/CustomLogs",
+            ),
+            AutoStartScope.CURRENT_USER,
+            False,
         )
 
 
@@ -844,7 +860,76 @@ def test_open_system_settings_dialog_persists_effective_storage_modes_after_fall
         config_mode="appdata",
         log_mode="localappdata",
     )
-    assert warnings[-1] == "指定的 .exe 所在路徑不可寫入，已自動回退到 AppData/LocalAppData。"
+    assert warnings[-1] == "指定的儲存位置不可寫入，已自動回退到預設位置。"
+
+
+def test_open_system_settings_dialog_persists_custom_storage_paths(
+    monkeypatch,
+    qtbot,
+    tmp_path,
+) -> None:
+    app = QApplication.instance()
+    assert app is not None
+
+    monkeypatch.setattr("watchdog_app.app.MonitorEngine", DummyMonitorEngine)
+    monkeypatch.setattr("watchdog_app.app.MainWindow", DummyMainWindow)
+    monkeypatch.setattr("watchdog_app.app.QSystemTrayIcon", DummyTrayIcon)
+    monkeypatch.setattr(
+        "watchdog_app.app.AppController._load_status_icons",
+        lambda self: (_solid_icon(Qt.GlobalColor.green), _solid_icon(Qt.GlobalColor.red)),
+    )
+    monkeypatch.setattr("watchdog_app.app.SystemSettingsDialog", DummyCustomStorageSystemSettingsDialog)
+    monkeypatch.setattr(
+        "watchdog_app.app.apply_autostart",
+        lambda scope: AutoStartStatus(scope=scope, provider=AutoStartProvider.REGISTRY_RUN, enabled=True),
+    )
+
+    resolved = ResolvedPaths(
+        bootstrap_path=tmp_path / "bootstrap.json",
+        config_path=Path("D:/CustomConfig/config.json"),
+        log_directory=Path("E:/CustomLogs"),
+    )
+    monkeypatch.setattr("watchdog_app.app.resolve_paths", lambda _storage: resolved)
+    monkeypatch.setattr(
+        "watchdog_app.app.effective_storage_preferences",
+        lambda _resolved: StoragePreferences(
+            config_mode="custom",
+            log_mode="custom",
+            config_custom_path="D:/CustomConfig",
+            log_custom_path="E:/CustomLogs",
+        ),
+    )
+    monkeypatch.setattr("watchdog_app.app.update_bootstrap_for_storage", lambda _storage: resolved)
+    monkeypatch.setattr("watchdog_app.app.configure_logging", lambda *_args, **_kwargs: None)
+
+    saved: list[AppConfig] = []
+    monkeypatch.setattr(
+        "watchdog_app.app.save_config",
+        lambda config, path: saved.append(AppConfig.from_dict(config.to_dict())) or path,
+    )
+
+    controller = AppController(
+        app,
+        AppConfig.default(),
+        ResolvedPaths(
+            bootstrap_path=tmp_path / "bootstrap.json",
+            config_path=tmp_path / "config.json",
+            log_directory=tmp_path / "logs",
+        ),
+        DummySingleInstance(),
+    )
+    qtbot.addWidget(controller._window)
+
+    controller.open_system_settings_dialog()
+
+    assert saved[0].storage == StoragePreferences(
+        config_mode=StorageMode.CUSTOM,
+        log_mode=StorageMode.CUSTOM,
+        config_custom_path="D:/CustomConfig",
+        log_custom_path="E:/CustomLogs",
+    )
+    assert controller._config.storage == saved[0].storage
+    assert controller._resolved_paths == resolved
 
 
 def test_open_system_settings_dialog_removes_staged_config_when_later_step_fails(
@@ -997,6 +1082,87 @@ def test_apply_config_failure_restores_last_good_config_and_shows_warning(monkey
     assert controller._window.config.targets[0].name == "Original"
     assert controller._monitor.config.targets[0].name == "Original"
     assert warnings == ["無法儲存設定：disk full"]
+
+
+def test_apply_config_success_updates_window_and_monitor_live_config(monkeypatch, qtbot, tmp_path) -> None:
+    app = QApplication.instance()
+    assert app is not None
+
+    monkeypatch.setattr("watchdog_app.app.MonitorEngine", DummyMonitorEngine)
+    monkeypatch.setattr("watchdog_app.app.MainWindow", DummyMainWindow)
+    monkeypatch.setattr("watchdog_app.app.QSystemTrayIcon", DummyTrayIcon)
+    monkeypatch.setattr(
+        "watchdog_app.app.AppController._load_status_icons",
+        lambda self: (_solid_icon(Qt.GlobalColor.green), _solid_icon(Qt.GlobalColor.red)),
+    )
+
+    saved_configs: list[AppConfig] = []
+
+    def _save_config(config: AppConfig, _path) -> None:
+        saved_configs.append(config)
+
+    monkeypatch.setattr("watchdog_app.app.save_config", _save_config)
+
+    initial = AppConfig.from_dict(
+        {
+            "targets": [
+                {
+                    "id": "alpha",
+                    "name": "Original",
+                    "enabled": True,
+                    "launch": {"path": "C:/original.exe", "args": [], "working_dir": "", "kind": "exe"},
+                    "checks": [
+                        {
+                            "type": "process_name",
+                            "process_name": "original.exe",
+                            "executable_path": "C:/original.exe",
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    changed = AppConfig.from_dict(
+        {
+            "targets": [
+                {
+                    "id": "alpha",
+                    "name": "Changed",
+                    "enabled": True,
+                    "launch": {"path": "C:/changed.exe", "args": [], "working_dir": "", "kind": "exe"},
+                    "checks": [
+                        {
+                            "type": "process_name",
+                            "process_name": "changed.exe",
+                            "executable_path": "C:/changed.exe",
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+    controller = AppController(
+        app,
+        initial,
+        ResolvedPaths(
+            bootstrap_path=tmp_path / "bootstrap.json",
+            config_path=tmp_path / "config.json",
+            log_directory=tmp_path / "logs",
+        ),
+        DummySingleInstance(),
+    )
+    qtbot.addWidget(controller._window)
+
+    controller.apply_config(changed)
+
+    assert saved_configs
+    assert controller._config.targets[0].launch.path == "C:/changed.exe"
+    assert controller._config.targets[0].checks[0].process_name == "changed.exe"
+    assert controller._window.config.targets[0].launch.path == "C:/changed.exe"
+    assert controller._window.config.targets[0].checks[0].process_name == "changed.exe"
+    assert controller._monitor.config.targets[0].launch.path == "C:/changed.exe"
+    assert controller._monitor.config.targets[0].checks[0].process_name == "changed.exe"
 
 
 def test_existing_instance_show_request_uses_recovery_loader(monkeypatch, qtbot, tmp_path) -> None:

@@ -15,6 +15,7 @@ from watchdog_app.models import (
     StoragePreferences,
     StorageMode,
     TargetConfig,
+    normalize_path_text,
 )
 
 
@@ -138,3 +139,67 @@ def test_app_config_defaults_disabled_provider_to_none() -> None:
 
     assert config.auto_start_scope == AutoStartScope.DISABLED
     assert config.auto_start_provider == AutoStartProvider.NONE
+
+
+def test_storage_preferences_support_custom_paths_round_trip() -> None:
+    storage = StoragePreferences(
+        config_mode="custom",
+        log_mode="custom",
+        config_custom_path="D:/ConfigRoot",
+        log_custom_path="E:/LogRoot",
+    ).validate()
+
+    raw = storage.to_dict()
+
+    assert raw == {
+        "config_mode": "custom",
+        "log_mode": "custom",
+        "config_custom_path": "D:/ConfigRoot",
+        "log_custom_path": "E:/LogRoot",
+    }
+    restored = StoragePreferences.from_dict(raw).validate()
+    assert restored == storage
+
+
+def test_path_like_fields_are_normalized_to_forward_slashes() -> None:
+    config = AppConfig.from_dict(
+        {
+            "storage": {
+                "config_mode": "custom",
+                "log_mode": "custom",
+                "config_custom_path": r"D:\Config Root",
+                "log_custom_path": r"E:\Log Root",
+            },
+            "targets": [
+                {
+                    "id": "alpha",
+                    "name": "Alpha",
+                    "enabled": True,
+                    "launch": {
+                        "path": r"C:\Apps\demo.exe",
+                        "args": [],
+                        "working_dir": r"C:\Apps",
+                        "kind": "exe",
+                    },
+                    "checks": [
+                        {"type": "pidfile", "pidfile_path": r"C:\Apps\demo.pid"},
+                        {
+                            "type": "process_name",
+                            "process_name": "demo.exe",
+                            "executable_path": r"C:\Apps\demo.exe",
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+
+    target = config.targets[0]
+    assert target.launch.path == "C:/Apps/demo.exe"
+    assert target.launch.working_dir == "C:/Apps"
+    assert target.checks[0].pidfile_path == "C:/Apps/demo.pid"
+    assert target.checks[1].executable_path == "C:/Apps/demo.exe"
+    assert config.storage.config_custom_path == "D:/Config Root"
+    assert config.storage.log_custom_path == "E:/Log Root"
+    assert config.to_dict()["targets"][0]["launch"]["path"] == "C:/Apps/demo.exe"
+    assert normalize_path_text(r"\\server\share\folder") == "//server/share/folder"

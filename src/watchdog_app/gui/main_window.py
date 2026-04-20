@@ -44,10 +44,11 @@ from ..models import (
     LaunchSpec,
     ResolvedPaths,
     TargetConfig,
+    normalize_path_text,
 )
 from ..monitor import MonitorEvent, TargetRuntimeState
 from ..monitor import TargetStatus
-from ..launchers import detect_launch_kind
+from ..launchers import detect_launch_kind, infer_process_match
 from .dialogs import CheckEditorDialog, ReadOnlyTextDialog
 
 
@@ -249,6 +250,7 @@ class MainWindow(QMainWindow):
         self._monitoring_running = False
         self._targets_table_updating = False
         self._splitter_initialized = False
+        self._editor_loading = False
 
         self.setWindowTitle("WatchDog 參數設定")
         self.resize(1280, 780)
@@ -314,6 +316,7 @@ class MainWindow(QMainWindow):
         self._path_edit = QLineEdit(self)
         self._args_edit = QLineEdit(self)
         self._working_dir_edit = QLineEdit(self)
+        self._path_edit.editingFinished.connect(self._apply_path_based_defaults)
         self._kind_combo = QComboBox(self)
         for kind in LaunchKind:
             self._kind_combo.addItem(LAUNCH_KIND_TEXT[kind], kind)
@@ -409,7 +412,9 @@ class MainWindow(QMainWindow):
             else:
                 selected, _ = QFileDialog.getOpenFileName(self, "選擇檔案", line_edit.text())
             if selected:
-                line_edit.setText(selected)
+                line_edit.setText(normalize_path_text(selected))
+                if line_edit is self._path_edit:
+                    self._apply_path_based_defaults()
 
         button.clicked.connect(_browse)
         layout.addWidget(line_edit, 1)
@@ -687,6 +692,7 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _new_target(self) -> None:
+        self._editor_loading = True
         self._targets_table.clearSelection()
         self._current_target_id = None
         self._current_target_enabled = False
@@ -701,6 +707,7 @@ class MainWindow(QMainWindow):
         self._cooldown_spin.setValue(1.0)
         self._logic_combo.setCurrentIndex(0)
         self._refresh_checks_table()
+        self._editor_loading = False
         self._name_edit.setFocus()
 
     @staticmethod
@@ -726,6 +733,7 @@ class MainWindow(QMainWindow):
         )
         if not selected:
             return
+        selected = normalize_path_text(selected)
 
         existing_index = self._find_target_index_by_path(selected)
         if existing_index >= 0:
@@ -743,9 +751,9 @@ class MainWindow(QMainWindow):
             name=path.stem or path.name,
             enabled=False,
             launch=LaunchSpec(
-                path=str(path),
+                path=normalize_path_text(path),
                 args=[],
-                working_dir=str(path.parent),
+                working_dir=normalize_path_text(path.parent),
                 kind=detect_launch_kind(str(path)),
             ),
             startup_delay_sec=0.05,
@@ -769,6 +777,7 @@ class MainWindow(QMainWindow):
         if index < 0 or index >= len(self._config.targets):
             return
         target = self._config.targets[index]
+        self._editor_loading = True
         self._current_target_id = target.id
         self._current_target_enabled = target.enabled
         self._name_edit.setText(target.name)
@@ -782,14 +791,18 @@ class MainWindow(QMainWindow):
         self._logic_combo.setCurrentIndex(max(0, self._logic_combo.findData(target.check_logic)))
         self._current_checks = [CheckSpec.from_dict(check.to_dict()) for check in target.checks]
         self._refresh_checks_table()
+        self._editor_loading = False
 
     def _collect_target(self) -> TargetConfig:
+        self._apply_path_based_defaults()
+        launch_path = self._path_edit.text()
+        checks = [CheckSpec.from_dict(check.to_dict()) for check in self._current_checks]
         return TargetConfig(
             id=self._current_target_id or "",
             name=self._name_edit.text(),
             enabled=self._current_target_enabled if self._current_target_id else False,
             launch=LaunchSpec(
-                path=self._path_edit.text(),
+                path=launch_path,
                 args=_parse_windows_command_args(self._args_edit.text()),
                 working_dir=self._working_dir_edit.text(),
                 kind=self._kind_combo.currentData(),
@@ -798,7 +811,7 @@ class MainWindow(QMainWindow):
             check_interval_sec=self._check_spin.value(),
             restart_cooldown_sec=self._cooldown_spin.value(),
             check_logic=self._logic_combo.currentData(),
-            checks=self._current_checks or [CheckSpec(type=CheckType.RUNTIME_PID)],
+            checks=checks or [CheckSpec(type=CheckType.RUNTIME_PID)],
         ).validate()
 
     def _save_target(self) -> None:
@@ -867,9 +880,11 @@ class MainWindow(QMainWindow):
         self._checks_table.resizeColumnsToContents()
 
     def _add_check(self) -> None:
-        dialog = CheckEditorDialog(parent=self)
+        dialog = CheckEditorDialog(parent=self, launch_path=self._path_edit.text())
         if dialog.exec():
-            self._current_checks.append(dialog.check_spec())
+            check = dialog.check_spec()
+            self._apply_path_defaults_to_check(self._path_edit.text(), check)
+            self._current_checks.append(check)
             self._refresh_checks_table()
 
     def _edit_check(self) -> None:
@@ -877,9 +892,11 @@ class MainWindow(QMainWindow):
         if index < 0:
             QMessageBox.warning(self, "未選擇檢查器", "請先選擇要編輯的檢查器。")
             return
-        dialog = CheckEditorDialog(self._current_checks[index], self)
+        dialog = CheckEditorDialog(self._current_checks[index], self, launch_path=self._path_edit.text())
         if dialog.exec():
-            self._current_checks[index] = dialog.check_spec()
+            check = dialog.check_spec()
+            self._apply_path_defaults_to_check(self._path_edit.text(), check)
+            self._current_checks[index] = check
             self._refresh_checks_table()
             self._checks_table.selectRow(index)
 
@@ -911,3 +928,63 @@ class MainWindow(QMainWindow):
     def _test_selected(self) -> None:
         if self._current_target_id:
             self.test_requested.emit(self._current_target_id)
+
+    @staticmethod
+    def _default_working_dir_for_path(path_text: str) -> str:
+        stripped = path_text.strip()
+        if not stripped:
+            return ""
+        parent = Path(stripped).expanduser().parent
+        parent_text = normalize_path_text(parent)
+        return "" if parent_text == "." else parent_text
+
+    @staticmethod
+    def _default_pidfile_path_for_path(path_text: str) -> str:
+        stripped = path_text.strip()
+        if not stripped:
+            return ""
+        target_path = Path(stripped).expanduser()
+        return normalize_path_text(target_path.with_suffix(".pid"))
+
+    @classmethod
+    def _apply_path_defaults_to_check(cls, path_text: str, check: CheckSpec) -> bool:
+        changed = False
+        if not path_text.strip():
+            return False
+
+        if check.type == CheckType.PIDFILE and not check.pidfile_path.strip():
+            check.pidfile_path = cls._default_pidfile_path_for_path(path_text)
+            changed = bool(check.pidfile_path)
+        elif check.type == CheckType.PROCESS_NAME:
+            inference = None
+            if not check.process_name.strip() or not check.executable_path.strip():
+                inference = infer_process_match(path_text)
+            if not check.process_name.strip() and inference is not None:
+                check.process_name = inference.process_name
+                changed = True
+            if not check.executable_path.strip() and inference is not None:
+                check.executable_path = inference.executable_path
+                changed = True
+        return changed
+
+    @classmethod
+    def _apply_path_defaults_to_checks(cls, path_text: str, checks: list[CheckSpec]) -> bool:
+        changed = False
+        for check in checks:
+            changed = cls._apply_path_defaults_to_check(path_text, check) or changed
+        return changed
+
+    def _apply_path_based_defaults(self) -> None:
+        if self._editor_loading:
+            return
+        path_text = self._path_edit.text()
+        if not path_text.strip():
+            return
+
+        if not self._working_dir_edit.text().strip():
+            default_working_dir = self._default_working_dir_for_path(path_text)
+            if default_working_dir:
+                self._working_dir_edit.setText(default_working_dir)
+
+        if self._apply_path_defaults_to_checks(path_text, self._current_checks):
+            self._refresh_checks_table()

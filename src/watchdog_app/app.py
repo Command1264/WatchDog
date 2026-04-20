@@ -497,14 +497,14 @@ class AppController(QObject):
         )
         if effective_storage != requested_storage:
             logger.warning(
-                "Requested EXE storage was not writable; falling back to config=%s log=%s.",
+                "Requested storage was not writable; falling back to config=%s log=%s.",
                 candidate.storage.config_mode.value,
                 candidate.storage.log_mode.value,
             )
             QMessageBox.warning(
                 self._window,
                 "儲存位置已回退",
-                "指定的 .exe 所在路徑不可寫入，已自動回退到 AppData/LocalAppData。",
+                "指定的儲存位置不可寫入，已自動回退到預設位置。",
             )
 
     def exit_user(self) -> None:

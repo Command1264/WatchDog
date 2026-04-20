@@ -6,7 +6,7 @@ import shutil
 import subprocess
 import sys
 
-from .models import ConfigValidationError, LaunchKind, LaunchSpec
+from .models import ConfigValidationError, LaunchKind, LaunchSpec, normalize_path_text
 
 
 @dataclass(slots=True)
@@ -41,14 +41,14 @@ def infer_process_match(path: str) -> ProcessMatchInference:
     if launch_kind == LaunchKind.EXE:
         return ProcessMatchInference(
             process_name=target_path.name,
-            executable_path=str(target_path),
+            executable_path=normalize_path_text(target_path),
         )
 
     if launch_kind == LaunchKind.CMD:
         host = shutil.which("cmd.exe") or "cmd.exe"
         return ProcessMatchInference(
             process_name=Path(host).name,
-            executable_path=host,
+            executable_path=normalize_path_text(host),
             note="批次檔實際會由 cmd.exe 執行，名稱檢查將比對 cmd.exe。",
         )
 
@@ -56,7 +56,7 @@ def infer_process_match(path: str) -> ProcessMatchInference:
         host = shutil.which("powershell.exe") or "powershell.exe"
         return ProcessMatchInference(
             process_name=Path(host).name,
-            executable_path=host,
+            executable_path=normalize_path_text(host),
             note="PowerShell 腳本實際會由 powershell.exe 執行，名稱檢查將比對 powershell.exe。",
         )
 
@@ -70,12 +70,12 @@ def infer_process_match(path: str) -> ProcessMatchInference:
 
 def _python_host_executable() -> str:
     if not getattr(sys, "frozen", False):
-        return sys.executable
+        return normalize_path_text(sys.executable)
 
     for candidate in ("py.exe", "python.exe", "python"):
         resolved = shutil.which(candidate)
         if resolved:
-            return resolved
+            return normalize_path_text(resolved)
 
     raise ConfigValidationError("打包後找不到可用的 Python 直譯器，無法啟動 .py 目標。")
 
@@ -99,7 +99,7 @@ def launch_process(launch: LaunchSpec) -> LaunchResult:
     if not executable.exists():
         raise ConfigValidationError(f"啟動目標不存在：{launch.path}")
 
-    working_dir = launch.working_dir or str(executable.parent)
+    working_dir = launch.working_dir or normalize_path_text(executable.parent)
     working_path = Path(working_dir)
     if not working_path.exists():
         raise ConfigValidationError(f"工作目錄不存在：{working_dir}")
@@ -111,4 +111,4 @@ def launch_process(launch: LaunchSpec) -> LaunchResult:
         shell=False,
         start_new_session=True,
     )
-    return LaunchResult(pid=process.pid, command=command, working_dir=str(working_path))
+    return LaunchResult(pid=process.pid, command=command, working_dir=normalize_path_text(working_path))

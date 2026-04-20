@@ -8,7 +8,13 @@ import tempfile
 import winreg
 import xml.etree.ElementTree as ET
 
-from .models import APP_NAME, AutoStartProvider, AutoStartScope
+from .models import (
+    APP_NAME,
+    AutoStartProvider,
+    AutoStartScope,
+    normalize_path_text,
+    normalize_separators,
+)
 from .runtime import runtime_base_dir, startup_command, startup_command_line
 
 
@@ -105,7 +111,20 @@ def registry_command(scope: AutoStartScope | str) -> str | None:
     try:
         with winreg.OpenKey(hive, RUN_KEY, 0, winreg.KEY_READ) as handle:
             value, _ = winreg.QueryValueEx(handle, APP_NAME)
-            return str(value)
+            command = str(value)
+            normalized = normalize_separators(command)
+            if normalized != command:
+                try:
+                    with winreg.CreateKeyEx(hive, RUN_KEY, 0, access=winreg.KEY_SET_VALUE) as writable:
+                        winreg.SetValueEx(writable, APP_NAME, 0, winreg.REG_SZ, normalized)
+                    logger.info("Normalized autostart registry path separators. scope=%s", scope.value)
+                except OSError as exc:
+                    logger.warning(
+                        "Failed to rewrite legacy autostart registry value. scope=%s error=%s",
+                        scope.value,
+                        exc,
+                    )
+            return normalized
     except FileNotFoundError:
         return None
     except OSError:
@@ -189,7 +208,9 @@ def _build_all_users_task_xml_tree() -> ET.Element:
         ET.SubElement(exec_action, f"{{{TASK_XML_NAMESPACE}}}Arguments").text = subprocess.list2cmdline(
             command[1:]
         )
-    ET.SubElement(exec_action, f"{{{TASK_XML_NAMESPACE}}}WorkingDirectory").text = str(runtime_base_dir())
+    ET.SubElement(exec_action, f"{{{TASK_XML_NAMESPACE}}}WorkingDirectory").text = normalize_path_text(
+        runtime_base_dir()
+    )
 
     return task
 

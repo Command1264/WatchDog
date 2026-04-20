@@ -9,7 +9,7 @@ import time
 from watchdog_app.models import AppConfig, CheckSpec, CheckType, LaunchKind, LaunchSpec, TargetConfig
 from watchdog_app.launchers import LaunchResult
 from watchdog_app.checkers import AggregatedCheckResult, CheckResult
-from watchdog_app.monitor import MonitorEngine, TargetStatus
+from watchdog_app.monitor import MonitorEngine, TargetRuntimeState, TargetStatus
 
 
 def _free_port() -> int:
@@ -314,3 +314,90 @@ def test_set_config_while_running_respects_startup_delay_for_new_target(monkeypa
         assert launches == ["C:/dynamic.exe"]
     finally:
         engine.shutdown()
+
+
+def test_set_config_resets_runtime_state_and_reschedules_reconfigured_target(monkeypatch) -> None:
+    launches: list[str] = []
+    clock = {"now": 10.0}
+
+    def _fake_launch(launch: LaunchSpec) -> LaunchResult:
+        launches.append(launch.path)
+        return LaunchResult(pid=9876, command=[launch.path], working_dir="C:/")
+
+    monkeypatch.setattr("watchdog_app.monitor.launch_process", _fake_launch)
+    monkeypatch.setattr(
+        "watchdog_app.monitor.evaluate_target",
+        lambda target, context: AggregatedCheckResult(
+            healthy=False,
+            check_results=[CheckResult(False, "名稱檢查", "程序不存在。")],
+            summary="檢查失敗",
+        ),
+    )
+
+    original = TargetConfig(
+        id="alpha",
+        name="Alpha",
+        enabled=True,
+        launch=LaunchSpec(path="C:/old.exe", kind=LaunchKind.EXE, working_dir="C:/"),
+        startup_delay_sec=1.0,
+        check_interval_sec=5.0,
+        restart_cooldown_sec=5.0,
+        checks=[
+            CheckSpec(
+                type=CheckType.PROCESS_NAME,
+                process_name="old.exe",
+                executable_path="C:/old.exe",
+            )
+        ],
+    ).validate()
+    updated = TargetConfig(
+        id="alpha",
+        name="Alpha",
+        enabled=True,
+        launch=LaunchSpec(path="C:/new.exe", kind=LaunchKind.EXE, working_dir="C:/"),
+        startup_delay_sec=1.5,
+        check_interval_sec=5.0,
+        restart_cooldown_sec=5.0,
+        checks=[
+            CheckSpec(
+                type=CheckType.PROCESS_NAME,
+                process_name="new.exe",
+                executable_path="C:/new.exe",
+            )
+        ],
+    ).validate()
+
+    engine = MonitorEngine(
+        AppConfig(targets=[original]).validate(),
+        time_provider=lambda: clock["now"],
+        wall_time_provider=lambda: 1000.0,
+        sleep_interval=0.01,
+    )
+    engine._running = True
+    engine._states["alpha"] = TargetRuntimeState(
+        status=TargetStatus.RUNNING,
+        runtime_pid=111,
+        last_check_at=900.0,
+        last_restart_at=800.0,
+        last_restart_monotonic=9.0,
+        last_error="stale",
+        last_error_detail="stale detail",
+        next_check_at=999.0,
+    )
+
+    engine.set_config(AppConfig(targets=[updated]).validate())
+
+    state = engine.states["alpha"]
+    assert state.status == TargetStatus.STOPPED
+    assert state.runtime_pid is None
+    assert state.last_error == ""
+    assert state.last_error_detail == ""
+    assert state.next_check_at == 0.0
+    assert engine._startup_queue == ["alpha"]
+    assert engine._next_start_at == 11.5
+
+    engine._handle_start_sequence(11.4, 1000.0)
+    assert launches == []
+
+    engine._handle_start_sequence(11.6, 1000.0)
+    assert launches == ["C:/new.exe"]

@@ -18,6 +18,7 @@ from watchdog_app.models import (
     StorageMode,
     StoragePreferences,
     TargetConfig,
+    normalize_path_text,
 )
 from watchdog_app.monitor import MonitorEvent, TargetRuntimeState, TargetStatus
 
@@ -61,7 +62,8 @@ def test_main_window_exposes_system_settings_via_more_settings_toolbar(qtbot, tm
         window._system_settings_action.trigger()
 
 
-def test_system_settings_dialog_inlines_storage_and_autostart_controls(qtbot, tmp_path) -> None:
+def test_system_settings_dialog_inlines_storage_and_autostart_controls(monkeypatch, qtbot, tmp_path) -> None:
+    monkeypatch.setattr("watchdog_app.gui.dialogs.runtime_base_dir", lambda: tmp_path / "exe-root")
     dialog = SystemSettingsDialog(
         StoragePreferences(
             config_mode=StorageMode.APPDATA,
@@ -80,10 +82,16 @@ def test_system_settings_dialog_inlines_storage_and_autostart_controls(qtbot, tm
     assert dialog.windowTitle() == "系統設定"
     assert dialog._scope_combo.currentData() == AutoStartScope.CURRENT_USER
     assert dialog._start_checkbox.isChecked() is True
-    assert dialog._config_path_label.text() == str(tmp_path / "config.json")
-    assert dialog._log_path_label.text() == str(tmp_path / "logs" / "WatchDogLogs")
+    assert dialog._storage_group.title() == "儲存位置"
+    assert dialog._autostart_group.title() == "自動啟動"
+    assert dialog._config_path_label.text() == normalize_path_text(tmp_path / "config.json")
+    assert dialog._log_path_label.text() == normalize_path_text(tmp_path / "logs" / "WatchDogLogs")
     assert dialog._save_button.text() == "儲存"
     assert dialog._cancel_button.text() == "取消"
+    assert dialog._config_custom_path_row.isEnabled() is False
+    assert dialog._log_custom_path_row.isEnabled() is False
+    assert dialog._config_custom_path.text() == normalize_path_text(tmp_path / "exe-root")
+    assert dialog._log_custom_path.text() == normalize_path_text(tmp_path / "exe-root")
 
     dialog._config_combo.setCurrentIndex(dialog._config_combo.findData(StorageMode.EXE))
     dialog._log_combo.setCurrentIndex(dialog._log_combo.findData(StorageMode.EXE))
@@ -95,13 +103,49 @@ def test_system_settings_dialog_inlines_storage_and_autostart_controls(qtbot, tm
     assert start_on_login is True
 
 
+def test_system_settings_dialog_supports_custom_storage_paths(monkeypatch, qtbot, tmp_path) -> None:
+    monkeypatch.setattr("watchdog_app.gui.dialogs.runtime_base_dir", lambda: tmp_path / "exe-root")
+    dialog = SystemSettingsDialog(
+        StoragePreferences(
+            config_mode=StorageMode.CUSTOM,
+            log_mode=StorageMode.CUSTOM,
+            config_custom_path=normalize_path_text(tmp_path / "cfg"),
+            log_custom_path=normalize_path_text(tmp_path / "logs"),
+        ),
+        ResolvedPaths(
+            bootstrap_path=tmp_path / "bootstrap.json",
+            config_path=tmp_path / "cfg" / "config.json",
+            log_directory=tmp_path / "logs",
+        ),
+        AutoStartScope.CURRENT_USER,
+        False,
+    )
+    qtbot.addWidget(dialog)
+
+    assert dialog._config_custom_path_row.isEnabled() is True
+    assert dialog._log_custom_path_row.isEnabled() is True
+    assert dialog._config_path_label.text() == normalize_path_text(tmp_path / "cfg" / "config.json")
+    assert dialog._log_path_label.text() == normalize_path_text(tmp_path / "logs" / "WatchDogLogs")
+
+    dialog._config_custom_path.setText(normalize_path_text(tmp_path / "cfg2"))
+    dialog._log_custom_path.setText(normalize_path_text(tmp_path / "logs2"))
+    prefs, _, _ = dialog.values()
+
+    assert prefs == StoragePreferences(
+        config_mode=StorageMode.CUSTOM,
+        log_mode=StorageMode.CUSTOM,
+        config_custom_path=normalize_path_text(tmp_path / "cfg2"),
+        log_custom_path=normalize_path_text(tmp_path / "logs2"),
+    )
+
+
 def test_check_editor_can_infer_process_match_from_selected_path(monkeypatch, qtbot, tmp_path) -> None:
     dialog = CheckEditorDialog(CheckSpec(type=CheckType.PROCESS_NAME))
     qtbot.addWidget(dialog)
 
     monkeypatch.setattr(
         "watchdog_app.gui.dialogs.QFileDialog.getOpenFileName",
-        lambda *args, **kwargs: (str(tmp_path / "demo.bat"), ""),
+        lambda *args, **kwargs: (normalize_path_text(tmp_path / "demo.bat"), ""),
     )
 
     class _Inference:
@@ -117,6 +161,45 @@ def test_check_editor_can_infer_process_match_from_selected_path(monkeypatch, qt
     assert dialog._exe_path.text() == "C:/Windows/System32/cmd.exe"
     assert dialog._process_inference_note.text() == _Inference.note
     assert dialog._process_inference_note.isHidden() is False
+
+
+def test_check_editor_prefills_pidfile_from_launch_path_when_empty(qtbot, tmp_path) -> None:
+    target_path = tmp_path / "demo.exe"
+    dialog = CheckEditorDialog(
+        CheckSpec(type=CheckType.PIDFILE),
+        launch_path=normalize_path_text(target_path),
+    )
+    qtbot.addWidget(dialog)
+
+    assert dialog._pidfile_path.text() == normalize_path_text(target_path.with_suffix(".pid"))
+
+
+def test_check_editor_prefills_process_match_from_launch_path_when_empty(qtbot, tmp_path) -> None:
+    target_path = tmp_path / "demo.exe"
+    dialog = CheckEditorDialog(
+        CheckSpec(type=CheckType.PROCESS_NAME),
+        launch_path=normalize_path_text(target_path),
+    )
+    qtbot.addWidget(dialog)
+
+    assert dialog._process_name.text() == "demo.exe"
+    assert dialog._exe_path.text() == normalize_path_text(target_path)
+
+
+def test_check_editor_does_not_override_existing_process_values(qtbot, tmp_path) -> None:
+    target_path = tmp_path / "demo.exe"
+    dialog = CheckEditorDialog(
+        CheckSpec(
+            type=CheckType.PROCESS_NAME,
+            process_name="custom.exe",
+            executable_path="D:/custom/custom.exe",
+        ),
+        launch_path=normalize_path_text(target_path),
+    )
+    qtbot.addWidget(dialog)
+
+    assert dialog._process_name.text() == "custom.exe"
+    assert dialog._exe_path.text() == "D:/custom/custom.exe"
 
 
 def test_left_table_supports_checkbox_and_name_editing(qtbot, tmp_path) -> None:
@@ -700,7 +783,7 @@ def test_add_target_from_file_prefills_target_and_selects_it(monkeypatch, qtbot,
 
     monkeypatch.setattr(
         "watchdog_app.gui.main_window.QFileDialog.getOpenFileName",
-        lambda *args, **kwargs: (str(script), ""),
+        lambda *args, **kwargs: (normalize_path_text(script), ""),
     )
 
     with qtbot.waitSignal(window.config_changed):
@@ -709,14 +792,14 @@ def test_add_target_from_file_prefills_target_and_selects_it(monkeypatch, qtbot,
     assert len(window._config.targets) == 1
     target = window._config.targets[0]
     assert target.name == "dongle_reader"
-    assert target.launch.path == str(script)
-    assert target.launch.working_dir == str(script.parent)
+    assert target.launch.path == normalize_path_text(script)
+    assert target.launch.working_dir == normalize_path_text(script.parent)
     assert target.launch.kind == LaunchKind.POWERSHELL
     assert target.enabled is False
     assert target.checks[0].type == CheckType.RUNTIME_PID
     assert window._selected_index() == 0
     assert window._name_edit.text() == "dongle_reader"
-    assert window._path_edit.text() == str(script)
+    assert window._path_edit.text() == normalize_path_text(script)
     enabled_widget = window._targets_table.cellWidget(0, 0)
     assert isinstance(enabled_widget, CenteredCheckboxCell)
     assert enabled_widget.is_checked() is False
@@ -746,6 +829,149 @@ def test_save_new_target_defaults_to_disabled(qtbot, tmp_path) -> None:
     assert enabled_widget.is_checked() is False
 
 
+def test_save_existing_target_updates_launch_path_and_process_check(qtbot, tmp_path) -> None:
+    config = AppConfig(
+        targets=[
+            TargetConfig(
+                id="alpha",
+                name="Alpha",
+                enabled=True,
+                launch=LaunchSpec(path="C:/old.exe", working_dir="C:/", kind=LaunchKind.EXE),
+                checks=[
+                    CheckSpec(
+                        type=CheckType.PROCESS_NAME,
+                        process_name="old.exe",
+                        executable_path="C:/old.exe",
+                    )
+                ],
+            ).validate()
+        ]
+    ).validate()
+    window = MainWindow(
+        config,
+        ResolvedPaths(
+            bootstrap_path=tmp_path / "bootstrap.json",
+            config_path=tmp_path / "config.json",
+            log_directory=tmp_path / "logs",
+        ),
+    )
+    qtbot.addWidget(window)
+
+    window._targets_table.selectRow(0)
+    window._load_selected_target()
+    window._path_edit.setText("C:/new.exe")
+    window._current_checks = [
+        CheckSpec(
+            type=CheckType.PROCESS_NAME,
+            process_name="new.exe",
+            executable_path="C:/new.exe",
+        ).validate()
+    ]
+    window._refresh_checks_table()
+
+    with qtbot.waitSignal(window.config_changed):
+        window._save_target()
+
+    saved = window._config.targets[0]
+    assert saved.launch.path == "C:/new.exe"
+    assert saved.checks[0].process_name == "new.exe"
+    assert saved.checks[0].executable_path == "C:/new.exe"
+    assert window._path_edit.text() == "C:/new.exe"
+    assert window._checks_table.item(0, 1).text() == "程序名稱：new.exe @ C:/new.exe"
+
+
+def test_path_defaults_prefill_empty_working_dir_and_checks(qtbot, tmp_path) -> None:
+    target_path = tmp_path / "demo.exe"
+    target_path.write_text("", encoding="utf-8")
+    window = MainWindow(
+        AppConfig.default(),
+        ResolvedPaths(
+            bootstrap_path=tmp_path / "bootstrap.json",
+            config_path=tmp_path / "config.json",
+            log_directory=tmp_path / "logs",
+        ),
+    )
+    qtbot.addWidget(window)
+
+    window._current_checks = [
+        CheckSpec(type=CheckType.PIDFILE),
+        CheckSpec(type=CheckType.PROCESS_NAME),
+    ]
+    window._refresh_checks_table()
+    window._path_edit.setText(normalize_path_text(target_path))
+    window._apply_path_based_defaults()
+
+    assert window._working_dir_edit.text() == normalize_path_text(target_path.parent)
+    assert window._current_checks[0].pidfile_path == normalize_path_text(target_path.with_suffix(".pid"))
+    assert window._current_checks[1].process_name == "demo.exe"
+    assert window._current_checks[1].executable_path == normalize_path_text(target_path)
+    assert window._checks_table.item(0, 1).text() == f"PID 檔案：{normalize_path_text(target_path.with_suffix('.pid'))}"
+    assert window._checks_table.item(1, 1).text() == f"程序名稱：demo.exe @ {normalize_path_text(target_path)}"
+
+
+def test_path_defaults_do_not_override_existing_values(qtbot, tmp_path) -> None:
+    target_path = tmp_path / "demo.exe"
+    target_path.write_text("", encoding="utf-8")
+    window = MainWindow(
+        AppConfig.default(),
+        ResolvedPaths(
+            bootstrap_path=tmp_path / "bootstrap.json",
+            config_path=tmp_path / "config.json",
+            log_directory=tmp_path / "logs",
+        ),
+    )
+    qtbot.addWidget(window)
+
+    window._working_dir_edit.setText("D:/custom")
+    window._current_checks = [
+        CheckSpec(type=CheckType.PIDFILE, pidfile_path="D:/custom/custom.pid").validate(),
+        CheckSpec(
+            type=CheckType.PROCESS_NAME,
+            process_name="custom.exe",
+            executable_path="D:/custom/custom.exe",
+        ).validate(),
+    ]
+    window._refresh_checks_table()
+    window._path_edit.setText(normalize_path_text(target_path))
+    window._apply_path_based_defaults()
+
+    assert window._working_dir_edit.text() == "D:/custom"
+    assert window._current_checks[0].pidfile_path == "D:/custom/custom.pid"
+    assert window._current_checks[1].process_name == "custom.exe"
+    assert window._current_checks[1].executable_path == "D:/custom/custom.exe"
+
+
+def test_save_target_persists_path_based_defaults_for_empty_fields(qtbot, tmp_path) -> None:
+    target_path = tmp_path / "demo.exe"
+    target_path.write_text("", encoding="utf-8")
+    window = MainWindow(
+        AppConfig.default(),
+        ResolvedPaths(
+            bootstrap_path=tmp_path / "bootstrap.json",
+            config_path=tmp_path / "config.json",
+            log_directory=tmp_path / "logs",
+        ),
+    )
+    qtbot.addWidget(window)
+
+    window._name_edit.setText("Demo")
+    window._path_edit.setText(normalize_path_text(target_path))
+    window._current_checks = [
+        CheckSpec(type=CheckType.PIDFILE),
+        CheckSpec(type=CheckType.PROCESS_NAME),
+    ]
+    window._refresh_checks_table()
+
+    with qtbot.waitSignal(window.config_changed):
+        window._save_target()
+
+    saved = window._config.targets[0]
+    assert saved.launch.working_dir == normalize_path_text(target_path.parent)
+    assert saved.checks[0].pidfile_path == normalize_path_text(target_path.with_suffix(".pid"))
+    assert saved.checks[1].process_name == "demo.exe"
+    assert saved.checks[1].executable_path == normalize_path_text(target_path)
+
+
 def test_add_target_from_file_reuses_existing_target(monkeypatch, qtbot, tmp_path) -> None:
     exe_path = tmp_path / "demo.exe"
     exe_path.write_text("", encoding="utf-8")
@@ -755,7 +981,11 @@ def test_add_target_from_file_reuses_existing_target(monkeypatch, qtbot, tmp_pat
                 id="demo",
                 name="Demo",
                 enabled=True,
-                launch=LaunchSpec(path=str(exe_path), kind=LaunchKind.EXE, working_dir=str(tmp_path)),
+                launch=LaunchSpec(
+                    path=normalize_path_text(exe_path),
+                    kind=LaunchKind.EXE,
+                    working_dir=normalize_path_text(tmp_path),
+                ),
                 checks=[CheckSpec(type=CheckType.RUNTIME_PID)],
             ).validate()
         ]
@@ -772,7 +1002,7 @@ def test_add_target_from_file_reuses_existing_target(monkeypatch, qtbot, tmp_pat
 
     monkeypatch.setattr(
         "watchdog_app.gui.main_window.QFileDialog.getOpenFileName",
-        lambda *args, **kwargs: (str(exe_path), ""),
+        lambda *args, **kwargs: (normalize_path_text(exe_path), ""),
     )
     messages: list[str] = []
 

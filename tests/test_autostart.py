@@ -222,3 +222,33 @@ def test_remove_scheduled_task_without_scope_removes_both_task_names(monkeypatch
         autostart.TASK_NAME_ALL_USERS,
         autostart.TASK_NAME_ALL_USERS,
     ]
+
+
+def test_registry_command_normalizes_legacy_backslashes_and_writes_back(monkeypatch: object) -> None:
+    writes: list[tuple[object, str, int, object, str]] = []
+
+    class _Handle:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    monkeypatch.setattr(autostart.winreg, "OpenKey", lambda *args, **kwargs: _Handle())
+    monkeypatch.setattr(autostart.winreg, "CreateKeyEx", lambda *args, **kwargs: _Handle())
+    monkeypatch.setattr(
+        autostart.winreg,
+        "QueryValueEx",
+        lambda *_args, **_kwargs: ('"C:\\Watch Dog\\WatchDog.exe"', autostart.winreg.REG_SZ),
+    )
+    monkeypatch.setattr(
+        autostart.winreg,
+        "SetValueEx",
+        lambda *args: writes.append(args),
+    )
+
+    command = autostart.registry_command(AutoStartScope.CURRENT_USER)
+
+    assert command == '"C:/Watch Dog/WatchDog.exe"'
+    assert writes
+    assert writes[0][-1] == '"C:/Watch Dog/WatchDog.exe"'

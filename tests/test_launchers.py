@@ -6,7 +6,7 @@ import sys
 import pytest
 
 from watchdog_app.launchers import build_command, infer_process_match
-from watchdog_app.models import ConfigValidationError, LaunchKind, LaunchSpec
+from watchdog_app.models import ConfigValidationError, LaunchKind, LaunchSpec, normalize_path_text
 
 
 def test_python_launch_uses_current_interpreter() -> None:
@@ -14,7 +14,7 @@ def test_python_launch_uses_current_interpreter() -> None:
         LaunchSpec(path="C:/demo.py", args=["--ok"], kind=LaunchKind.PYTHON)
     )
 
-    assert command == [sys.executable, "C:/demo.py", "--ok"]
+    assert command == [normalize_path_text(sys.executable), "C:/demo.py", "--ok"]
 
 
 def test_auto_detects_cmd_files() -> None:

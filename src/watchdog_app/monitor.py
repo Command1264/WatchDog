@@ -97,13 +97,23 @@ class MonitorEngine:
             self._config = config.validate()
             previous_states = self._states
             updated_states: dict[str, TargetRuntimeState] = {}
+            previous_targets = {target.id: target for target in previous_config.targets}
             previous_enabled = {target.id: target.enabled for target in previous_config.targets}
+            reconfigured_target_ids: set[str] = set()
             for target in self._config.targets:
+                previous_target = previous_targets.get(target.id)
+                definition_changed = (
+                    previous_target is not None
+                    and self._target_behavior_snapshot(previous_target)
+                    != self._target_behavior_snapshot(target)
+                )
                 state = previous_states.get(target.id)
-                if state is None:
+                if state is None or definition_changed:
                     state = TargetRuntimeState(
                         status=TargetStatus.STOPPED if target.enabled else TargetStatus.DISABLED
                     )
+                    if definition_changed:
+                        reconfigured_target_ids.add(target.id)
                 elif not target.enabled:
                     state.status = TargetStatus.DISABLED
                 elif state.status == TargetStatus.DISABLED:
@@ -111,14 +121,28 @@ class MonitorEngine:
                 updated_states[target.id] = state
             self._states = updated_states
             valid_target_ids = set(updated_states)
-            self._startup_queue = [target_id for target_id in self._startup_queue if target_id in valid_target_ids]
+            self._startup_queue = [
+                target_id
+                for target_id in self._startup_queue
+                if target_id in valid_target_ids and target_id not in reconfigured_target_ids
+            ]
             if self._running:
                 queued_ids = set(self._startup_queue)
                 for target in self._config.targets:
-                    if target.enabled and not previous_enabled.get(target.id, False) and target.id not in queued_ids:
+                    if (
+                        target.enabled
+                        and (
+                            not previous_enabled.get(target.id, False)
+                            or target.id in reconfigured_target_ids
+                        )
+                        and target.id not in queued_ids
+                    ):
                         self._startup_queue.append(target.id)
                         queued_ids.add(target.id)
-                if (self._startup_queue[0] if self._startup_queue else None) != previous_queue_head:
+                if (
+                    reconfigured_target_ids
+                    or (self._startup_queue[0] if self._startup_queue else None) != previous_queue_head
+                ):
                     self._next_start_at = 0.0
                 self._sync_startup_schedule_locked(self._time())
             else:
@@ -434,6 +458,30 @@ class MonitorEngine:
     def _enabled_targets(self):
         with self._lock:
             return [target for target in self._config.targets if target.enabled]
+
+    @staticmethod
+    def _check_behavior_snapshot(check) -> dict[str, object]:
+        return {
+            "type": getattr(check.type, "value", check.type),
+            "pidfile_path": check.pidfile_path,
+            "process_name": check.process_name,
+            "executable_path": check.executable_path,
+            "host": check.host,
+            "port": check.port,
+            "url": check.url,
+            "method": check.method,
+            "timeout_sec": check.timeout_sec,
+            "expected_status": check.expected_status,
+            "body_substring": check.body_substring,
+        }
+
+    @classmethod
+    def _target_behavior_snapshot(cls, target) -> dict[str, object]:
+        return {
+            "launch": target.launch.to_dict(),
+            "check_logic": getattr(target.check_logic, "value", target.check_logic),
+            "checks": [cls._check_behavior_snapshot(check) for check in target.checks],
+        }
 
     def _sync_startup_schedule_locked(self, now: float) -> None:
         if not self._running:

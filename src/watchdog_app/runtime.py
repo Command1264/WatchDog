@@ -5,7 +5,15 @@ import os
 import subprocess
 import sys
 
-from .models import APP_NAME, BOOTSTRAP_FILE_NAME, CONFIG_FILE_NAME, ExitReason, LOGS_DIRECTORY_NAME
+from .models import (
+    APP_NAME,
+    BOOTSTRAP_FILE_NAME,
+    CONFIG_FILE_NAME,
+    ExitReason,
+    LOGS_DIRECTORY_NAME,
+    normalize_path_text,
+    normalize_separators,
+)
 
 
 def is_frozen() -> bool:
@@ -66,18 +74,18 @@ def default_log_path() -> Path:
 
 def child_command() -> list[str]:
     if is_frozen():
-        return [str(executable_path()), "--child-app"]
-    return [sys.executable, "-m", "watchdog_app.main", "--child-app"]
+        return [normalize_path_text(executable_path()), "--child-app"]
+    return [normalize_path_text(sys.executable), "-m", "watchdog_app.main", "--child-app"]
 
 
 def startup_command() -> list[str]:
     if is_frozen():
-        return [str(executable_path())]
-    return [sys.executable, "-m", "watchdog_app.main"]
+        return [normalize_path_text(executable_path())]
+    return [normalize_path_text(sys.executable), "-m", "watchdog_app.main"]
 
 
 def startup_command_line() -> str:
-    return subprocess.list2cmdline(startup_command())
+    return normalize_separators(subprocess.list2cmdline(startup_command()))
 
 
 def exit_code(reason: ExitReason) -> int:

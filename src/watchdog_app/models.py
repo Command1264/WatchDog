@@ -64,6 +64,7 @@ class StorageMode(str, Enum):
     EXE = "exe"
     APPDATA = "appdata"
     LOCALAPPDATA = "localappdata"
+    CUSTOM = "custom"
 
 
 class AutoStartScope(str, Enum):
@@ -102,6 +103,14 @@ def _coerce_bool(value: Any, field_name: str, *, default: bool | None = None) ->
     raise ConfigValidationError(f"{field_name} 的布林值格式無效：{value!r}")
 
 
+def normalize_separators(value: str) -> str:
+    return value.replace("\\", "/")
+
+
+def normalize_path_text(value: str | Path) -> str:
+    return normalize_separators(str(value)).strip()
+
+
 def _validate_min_interval(value: float, field_name: str) -> float:
     if value < MIN_INTERVAL_SECONDS:
         raise ConfigValidationError(
@@ -114,6 +123,13 @@ def _as_existing_parent(path_text: str, field_name: str) -> str:
     if not path_text.strip():
         raise ConfigValidationError(f"{field_name} 不可為空白。")
     return path_text.strip()
+
+
+def _as_path_text(path_text: str, field_name: str) -> str:
+    normalized = normalize_path_text(path_text)
+    if not normalized:
+        raise ConfigValidationError(f"{field_name} 不可為空白。")
+    return normalized
 
 
 def _as_loopback_host(host: str) -> str:
@@ -140,10 +156,10 @@ class LaunchSpec:
     kind: LaunchKind = LaunchKind.AUTO
 
     def validate(self) -> LaunchSpec:
-        self.path = _as_existing_parent(self.path, "launch.path")
+        self.path = _as_path_text(self.path, "launch.path")
         self.kind = _coerce_enum(LaunchKind, self.kind)  # type: ignore[assignment]
         if self.working_dir:
-            self.working_dir = self.working_dir.strip()
+            self.working_dir = normalize_path_text(self.working_dir)
         return self
 
     def to_dict(self) -> dict[str, Any]:
@@ -185,10 +201,10 @@ class CheckSpec:
         self.label = self.label.strip()
         self.timeout_sec = _validate_min_interval(float(self.timeout_sec), "check.timeout_sec")
         if self.type == CheckType.PIDFILE:
-            self.pidfile_path = _as_existing_parent(self.pidfile_path, "check.pidfile_path")
+            self.pidfile_path = _as_path_text(self.pidfile_path, "check.pidfile_path")
         elif self.type == CheckType.PROCESS_NAME:
             self.process_name = _as_existing_parent(self.process_name, "check.process_name")
-            self.executable_path = self.executable_path.strip()
+            self.executable_path = normalize_path_text(self.executable_path)
         elif self.type == CheckType.TCP_PORT:
             self.host = _as_loopback_host(self.host)
             if not (1 <= int(self.port) <= 65535):
@@ -312,10 +328,24 @@ class TargetConfig:
 class StoragePreferences:
     config_mode: StorageMode = StorageMode.APPDATA
     log_mode: StorageMode = StorageMode.LOCALAPPDATA
+    config_custom_path: str = ""
+    log_custom_path: str = ""
 
     def validate(self) -> StoragePreferences:
         self.config_mode = _coerce_enum(StorageMode, self.config_mode)  # type: ignore[assignment]
         self.log_mode = _coerce_enum(StorageMode, self.log_mode)  # type: ignore[assignment]
+        self.config_custom_path = normalize_path_text(self.config_custom_path)
+        self.log_custom_path = normalize_path_text(self.log_custom_path)
+        if self.config_mode == StorageMode.CUSTOM:
+            self.config_custom_path = _as_path_text(
+                self.config_custom_path,
+                "storage.config_custom_path",
+            )
+        if self.log_mode == StorageMode.CUSTOM:
+            self.log_custom_path = _as_path_text(
+                self.log_custom_path,
+                "storage.log_custom_path",
+            )
         return self
 
     def to_dict(self) -> dict[str, str]:
@@ -323,6 +353,8 @@ class StoragePreferences:
         return {
             "config_mode": self.config_mode.value,
             "log_mode": self.log_mode.value,
+            "config_custom_path": self.config_custom_path,
+            "log_custom_path": self.log_custom_path,
         }
 
     @classmethod
@@ -330,6 +362,8 @@ class StoragePreferences:
         return cls(
             config_mode=StorageMode(str(data.get("config_mode", StorageMode.APPDATA.value))),
             log_mode=StorageMode(str(data.get("log_mode", StorageMode.LOCALAPPDATA.value))),
+            config_custom_path=str(data.get("config_custom_path", "")),
+            log_custom_path=str(data.get("log_custom_path", "")),
         )
 
 
@@ -404,8 +438,8 @@ class BootstrapState:
     def to_dict(self) -> dict[str, Any]:
         return {
             "storage": self.storage.to_dict() if self.storage else None,
-            "config_path": self.config_path,
-            "log_directory": self.log_directory,
+            "config_path": normalize_path_text(self.config_path),
+            "log_directory": normalize_path_text(self.log_directory),
             "first_run_completed": self.first_run_completed,
         }
 
@@ -419,8 +453,8 @@ class BootstrapState:
         )
         return cls(
             storage=storage,
-            config_path=str(data.get("config_path", "")),
-            log_directory=str(data.get("log_directory", "")),
+            config_path=normalize_path_text(str(data.get("config_path", ""))),
+            log_directory=normalize_path_text(str(data.get("log_directory", ""))),
             first_run_completed=_coerce_bool(
                 data.get("first_run_completed"),
                 "bootstrap.first_run_completed",

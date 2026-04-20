@@ -13,6 +13,7 @@ from .models import (
     ResolvedPaths,
     StorageMode,
     StoragePreferences,
+    normalize_path_text,
 )
 from .runtime import appdata_dir, bootstrap_path, local_appdata_dir, runtime_base_dir
 
@@ -32,7 +33,12 @@ def load_bootstrap_state() -> BootstrapState:
     path = bootstrap_path()
     if not path.exists():
         return BootstrapState()
-    return BootstrapState.from_dict(_read_json(path))
+    raw = _read_json(path)
+    state = BootstrapState.from_dict(raw)
+    normalized = state.to_dict()
+    if raw != normalized:
+        _write_json(path, normalized)
+    return state
 
 
 def save_bootstrap_state(state: BootstrapState) -> Path:
@@ -41,12 +47,14 @@ def save_bootstrap_state(state: BootstrapState) -> Path:
     return path
 
 
-def _storage_root(mode: StorageMode) -> Path:
+def _storage_root(mode: StorageMode, custom_path: str = "") -> Path:
     if mode == StorageMode.EXE:
         return runtime_base_dir()
     if mode == StorageMode.APPDATA:
         return appdata_dir()
-    return local_appdata_dir()
+    if mode == StorageMode.LOCALAPPDATA:
+        return local_appdata_dir()
+    return Path(custom_path).expanduser()
 
 
 def _is_writable(directory: Path) -> bool:
@@ -61,8 +69,9 @@ def _is_writable(directory: Path) -> bool:
 
 
 def resolve_paths(storage: StoragePreferences) -> ResolvedPaths:
-    config_root = _storage_root(storage.config_mode)
-    log_root = _storage_root(storage.log_mode)
+    storage = storage.validate()
+    config_root = _storage_root(storage.config_mode, storage.config_custom_path)
+    log_root = _storage_root(storage.log_mode, storage.log_custom_path)
 
     config_fallback_used = False
     log_fallback_used = False
@@ -93,13 +102,22 @@ def effective_storage_preferences(resolved: ResolvedPaths) -> StoragePreferences
 
     config_mode = StorageMode.EXE if config_root == runtime_root else StorageMode.APPDATA
     log_mode = StorageMode.EXE if log_root == runtime_root else StorageMode.LOCALAPPDATA
+    config_custom_path = ""
+    log_custom_path = ""
 
     if config_root not in {runtime_root, appdata_root}:
-        config_mode = StorageMode.APPDATA
+        config_mode = StorageMode.CUSTOM
+        config_custom_path = normalize_path_text(config_root)
     if log_root not in {runtime_root, local_appdata_root}:
-        log_mode = StorageMode.LOCALAPPDATA
+        log_mode = StorageMode.CUSTOM
+        log_custom_path = normalize_path_text(log_root)
 
-    return StoragePreferences(config_mode=config_mode, log_mode=log_mode).validate()
+    return StoragePreferences(
+        config_mode=config_mode,
+        log_mode=log_mode,
+        config_custom_path=config_custom_path,
+        log_custom_path=log_custom_path,
+    ).validate()
 
 
 def discover_config_path() -> Path | None:
@@ -123,7 +141,12 @@ def load_config(path: Path | None = None) -> AppConfig:
     candidate = path or discover_config_path()
     if not candidate or not candidate.exists():
         return AppConfig.default()
-    return AppConfig.from_dict(_read_json(candidate))
+    raw = _read_json(candidate)
+    config = AppConfig.from_dict(raw)
+    normalized = config.to_dict()
+    if raw != normalized:
+        _write_json(candidate, normalized)
+    return config
 
 
 def save_config(config: AppConfig, path: Path) -> Path:
@@ -138,8 +161,8 @@ def update_bootstrap_for_storage(storage: StoragePreferences) -> ResolvedPaths:
     save_bootstrap_state(
         BootstrapState(
             storage=effective_storage,
-            config_path=str(resolved.config_path),
-            log_directory=str(resolved.log_directory),
+            config_path=normalize_path_text(resolved.config_path),
+            log_directory=normalize_path_text(resolved.log_directory),
             first_run_completed=True,
         )
     )

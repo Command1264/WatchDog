@@ -81,7 +81,14 @@ def test_configure_logging_creates_expected_log_path_and_header(tmp_path: Path) 
             / "WatchDog_2026-04-17-09-10-11.log"
         )
 
-        logging.getLogger("watchdog_app.test").info("hello")
+        root_logger.handle(
+            _record(
+                "watchdog_app.test",
+                logging.INFO,
+                "hello",
+                current_time,
+            )
+        )
 
         content = log_path.read_text(encoding="utf-8")
         assert (

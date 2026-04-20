@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -8,6 +10,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -29,7 +32,9 @@ from ..models import (
     ResolvedPaths,
     StorageMode,
     StoragePreferences,
+    normalize_path_text,
 )
+from ..runtime import runtime_base_dir
 from ..launchers import infer_process_match
 from ..storage import log_output_root, resolve_paths
 
@@ -58,7 +63,7 @@ def _with_browse(parent: QWidget, line_edit: QLineEdit, choose_directory: bool =
         else:
             selected, _ = QFileDialog.getOpenFileName(parent, "選擇檔案", line_edit.text())
         if selected:
-            line_edit.setText(selected)
+            line_edit.setText(normalize_path_text(selected))
 
     button.clicked.connect(_choose)
     layout.addWidget(line_edit, 1)
@@ -118,20 +123,27 @@ class SystemSettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("系統設定")
         self.setModal(True)
-        self.resize(560, 320)
+        self.resize(620, 420)
 
         self._storage = storage.validate()
         self._resolved_paths = resolved_paths
+        default_custom_root = normalize_path_text(runtime_base_dir())
 
         self._config_combo = QComboBox(self)
         self._config_combo.addItem(".exe 所在路徑", StorageMode.EXE)
         self._config_combo.addItem("AppData", StorageMode.APPDATA)
+        self._config_combo.addItem("自訂資料夾", StorageMode.CUSTOM)
         self._config_combo.setCurrentIndex(max(0, self._config_combo.findData(self._storage.config_mode)))
+        self._config_custom_path = QLineEdit(self._storage.config_custom_path or default_custom_root, self)
+        self._config_custom_path_row = _with_browse(self, self._config_custom_path, choose_directory=True)
 
         self._log_combo = QComboBox(self)
         self._log_combo.addItem(".exe 所在路徑", StorageMode.EXE)
         self._log_combo.addItem("LocalAppData", StorageMode.LOCALAPPDATA)
+        self._log_combo.addItem("自訂資料夾", StorageMode.CUSTOM)
         self._log_combo.setCurrentIndex(max(0, self._log_combo.findData(self._storage.log_mode)))
+        self._log_custom_path = QLineEdit(self._storage.log_custom_path or default_custom_root, self)
+        self._log_custom_path_row = _with_browse(self, self._log_custom_path, choose_directory=True)
 
         self._config_path_label = QLabel(self)
         self._config_path_label.setWordWrap(True)
@@ -147,18 +159,24 @@ class SystemSettingsDialog(QDialog):
         self._start_checkbox = QCheckBox("登入後自動開始監測", self)
         self._start_checkbox.setChecked(start_monitoring_on_login)
 
-        form = QFormLayout()
-        form.addRow("設定檔儲存", self._config_combo)
-        form.addRow("設定檔路徑", self._config_path_label)
-        form.addRow("日誌儲存", self._log_combo)
-        form.addRow("日誌路徑", self._log_path_label)
-        form.addRow("自動啟動範圍", self._scope_combo)
-        form.addRow("", self._start_checkbox)
+        self._storage_group = QGroupBox("儲存位置", self)
+        storage_form = QFormLayout(self._storage_group)
+        storage_form.addRow("設定檔儲存", self._config_combo)
+        storage_form.addRow("設定檔自訂資料夾", self._config_custom_path_row)
+        storage_form.addRow("設定檔路徑", self._config_path_label)
+        storage_form.addRow("日誌儲存", self._log_combo)
+        storage_form.addRow("日誌自訂資料夾", self._log_custom_path_row)
+        storage_form.addRow("日誌路徑", self._log_path_label)
+
+        self._autostart_group = QGroupBox("自動啟動", self)
+        autostart_form = QFormLayout(self._autostart_group)
+        autostart_form.addRow("自動啟動範圍", self._scope_combo)
+        autostart_form.addRow("", self._start_checkbox)
 
         button_box = QDialogButtonBox(self)
         self._save_button = button_box.addButton("儲存", QDialogButtonBox.ButtonRole.AcceptRole)
         self._cancel_button = button_box.addButton("取消", QDialogButtonBox.ButtonRole.RejectRole)
-        self._save_button.clicked.connect(self.accept)
+        self._save_button.clicked.connect(self._accept_with_validation)
         self._cancel_button.clicked.connect(self.reject)
 
         info = QLabel("調整 WatchDog 的儲存位置與自動啟動設定。", self)
@@ -166,30 +184,73 @@ class SystemSettingsDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.addWidget(info)
-        layout.addLayout(form)
+        layout.addWidget(self._storage_group)
+        layout.addWidget(self._autostart_group)
         layout.addWidget(button_box)
 
         self._config_combo.currentIndexChanged.connect(self._refresh_path_preview)
         self._log_combo.currentIndexChanged.connect(self._refresh_path_preview)
+        self._config_custom_path.textChanged.connect(self._refresh_path_preview)
+        self._log_custom_path.textChanged.connect(self._refresh_path_preview)
         self._refresh_path_preview()
 
     def _refresh_path_preview(self) -> None:
-        preview_prefs = self.storage_preferences()
+        self._config_custom_path_row.setEnabled(self._config_combo.currentData() == StorageMode.CUSTOM)
+        self._log_custom_path_row.setEnabled(self._log_combo.currentData() == StorageMode.CUSTOM)
+        try:
+            preview_prefs = self.storage_preferences()
+        except ConfigValidationError:
+            if (
+                self._config_combo.currentData() == StorageMode.CUSTOM
+                and not self._config_custom_path.text().strip()
+            ):
+                self._config_path_label.setText("請先選擇自訂資料夾")
+            else:
+                self._config_path_label.setText(normalize_path_text(self._resolved_paths.config_path))
+            if (
+                self._log_combo.currentData() == StorageMode.CUSTOM
+                and not self._log_custom_path.text().strip()
+            ):
+                self._log_path_label.setText("請先選擇自訂資料夾")
+            else:
+                self._log_path_label.setText(
+                    normalize_path_text(log_output_root(self._resolved_paths.log_directory))
+                )
+            return
+
         if (
             preview_prefs.config_mode == self._storage.config_mode
             and preview_prefs.log_mode == self._storage.log_mode
+            and (
+                preview_prefs.config_mode != StorageMode.CUSTOM
+                or preview_prefs.config_custom_path == self._storage.config_custom_path
+            )
+            and (
+                preview_prefs.log_mode != StorageMode.CUSTOM
+                or preview_prefs.log_custom_path == self._storage.log_custom_path
+            )
         ):
             preview = self._resolved_paths
         else:
             preview = resolve_paths(preview_prefs)
-        self._config_path_label.setText(str(preview.config_path))
-        self._log_path_label.setText(str(log_output_root(preview.log_directory)))
+        self._config_path_label.setText(normalize_path_text(preview.config_path))
+        self._log_path_label.setText(normalize_path_text(log_output_root(preview.log_directory)))
 
     def storage_preferences(self) -> StoragePreferences:
         return StoragePreferences(
             config_mode=self._config_combo.currentData(),
             log_mode=self._log_combo.currentData(),
+            config_custom_path=self._config_custom_path.text(),
+            log_custom_path=self._log_custom_path.text(),
         ).validate()
+
+    def _accept_with_validation(self) -> None:
+        try:
+            self.storage_preferences()
+        except ConfigValidationError as exc:
+            QMessageBox.warning(self, "系統設定錯誤", str(exc))
+            return
+        self.accept()
 
     def values(self) -> tuple[StoragePreferences, AutoStartScope, bool]:
         scope = self._scope_combo.currentData()
@@ -203,12 +264,19 @@ class SystemSettingsDialog(QDialog):
 
 
 class CheckEditorDialog(QDialog):
-    def __init__(self, check: CheckSpec | None = None, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        check: CheckSpec | None = None,
+        parent: QWidget | None = None,
+        *,
+        launch_path: str = "",
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("檢查器設定")
         self.setModal(True)
 
         current = check or CheckSpec(type=CheckType.RUNTIME_PID)
+        self._launch_path = normalize_path_text(launch_path)
 
         self._type_combo = QComboBox(self)
         self._type_combo.addItem("PID 檢查", CheckType.RUNTIME_PID)
@@ -279,6 +347,7 @@ class CheckEditorDialog(QDialog):
         self._stack.addWidget(tcp_page)
         self._stack.addWidget(http_page)
         self._type_combo.currentIndexChanged.connect(self._stack.setCurrentIndex)
+        self._type_combo.currentIndexChanged.connect(self._apply_launch_path_defaults)
 
         type_to_index = {
             CheckType.RUNTIME_PID: 0,
@@ -306,6 +375,36 @@ class CheckEditorDialog(QDialog):
         layout.addWidget(buttons)
 
         self._update_process_inference_note("")
+        self._apply_launch_path_defaults()
+
+    @staticmethod
+    def _default_pidfile_path_for_launch_path(path_text: str) -> str:
+        if not path_text.strip():
+            return ""
+        return normalize_path_text(Path(path_text).expanduser().with_suffix(".pid"))
+
+    def _apply_launch_path_defaults(self, *_args) -> None:
+        if not self._launch_path:
+            return
+
+        check_type = self._type_combo.currentData()
+        if check_type == CheckType.PIDFILE:
+            if not self._pidfile_path.text().strip():
+                self._pidfile_path.setText(
+                    self._default_pidfile_path_for_launch_path(self._launch_path)
+                )
+            return
+
+        if check_type == CheckType.PROCESS_NAME:
+            if self._process_name.text().strip() and self._exe_path.text().strip():
+                return
+            inferred = infer_process_match(self._launch_path)
+            if not self._process_name.text().strip():
+                self._process_name.setText(inferred.process_name)
+            if not self._exe_path.text().strip():
+                self._exe_path.setText(inferred.executable_path)
+            if inferred.note and not self._process_inference_note.text():
+                self._update_process_inference_note(inferred.note)
 
     def _infer_process_match_from_path(self) -> None:
         selected, _ = QFileDialog.getOpenFileName(
