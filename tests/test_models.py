@@ -161,6 +161,18 @@ def test_storage_preferences_support_custom_paths_round_trip() -> None:
     assert restored == storage
 
 
+def test_storage_preferences_clear_irrelevant_custom_paths() -> None:
+    storage = StoragePreferences(
+        config_mode="exe",
+        log_mode="localappdata",
+        config_custom_path="D:/IgnoredConfig",
+        log_custom_path="E:/IgnoredLogs",
+    ).validate()
+
+    assert storage.config_custom_path == ""
+    assert storage.log_custom_path == ""
+
+
 def test_path_like_fields_are_normalized_to_forward_slashes() -> None:
     config = AppConfig.from_dict(
         {

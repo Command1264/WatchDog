@@ -341,11 +341,15 @@ class StoragePreferences:
                 self.config_custom_path,
                 "storage.config_custom_path",
             )
+        else:
+            self.config_custom_path = ""
         if self.log_mode == StorageMode.CUSTOM:
             self.log_custom_path = _as_path_text(
                 self.log_custom_path,
                 "storage.log_custom_path",
             )
+        else:
+            self.log_custom_path = ""
         return self
 
     def to_dict(self) -> dict[str, str]:
