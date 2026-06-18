@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 import logging
 import os
@@ -10,9 +11,9 @@ import traceback
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QCursor, QIcon, QMouseEvent, QPixmap
-from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
+from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QProgressDialog, QSystemTrayIcon
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -21,7 +22,15 @@ if __package__ in {None, ""}:
     from watchdog_app.gui.dialogs import StorageSetupDialog, SystemSettingsDialog
     from watchdog_app.gui.main_window import MainWindow
     from watchdog_app.logging_utils import configure_logging
-    from watchdog_app.models import AppConfig, AutoStartProvider, AutoStartScope, BootstrapState, ExitReason
+    from watchdog_app.models import (
+        AppConfig,
+        AutoStartProvider,
+        AutoStartScope,
+        BootstrapState,
+        ExitReason,
+        ResolvedPaths,
+        StoragePreferences,
+    )
     from watchdog_app.monitor import MonitorEngine
     from watchdog_app.runtime import bootstrap_path, not_ready_icon_path, ready_icon_path
     from watchdog_app.single_instance import SingleInstanceCoordinator
@@ -39,7 +48,15 @@ else:
     from .gui.dialogs import StorageSetupDialog, SystemSettingsDialog
     from .gui.main_window import MainWindow
     from .logging_utils import configure_logging
-    from .models import AppConfig, AutoStartProvider, AutoStartScope, BootstrapState, ExitReason
+    from .models import (
+        AppConfig,
+        AutoStartProvider,
+        AutoStartScope,
+        BootstrapState,
+        ExitReason,
+        ResolvedPaths,
+        StoragePreferences,
+    )
     from .monitor import MonitorEngine
     from .runtime import bootstrap_path, not_ready_icon_path, ready_icon_path
     from .single_instance import SingleInstanceCoordinator
@@ -55,6 +72,155 @@ else:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _clone_config(config: AppConfig) -> AppConfig:
+    return AppConfig.from_dict(config.validate().to_dict())
+
+
+@dataclass(slots=True)
+class SystemSettingsApplyResult:
+    candidate: AppConfig
+    resolved_paths: ResolvedPaths
+    active_log_path: Path | None
+    scope: AutoStartScope
+
+
+@dataclass(slots=True)
+class SystemSettingsApplyFailure:
+    previous_config: AppConfig
+    restored_paths: ResolvedPaths
+    message: str
+    rollback_errors: list[str]
+
+
+def _rollback_system_settings_side_effects(
+    previous_config: AppConfig,
+    previous_resolved_paths: ResolvedPaths,
+    transient_config_path: Path | None = None,
+) -> tuple[ResolvedPaths, list[str]]:
+    rollback_errors: list[str] = []
+
+    try:
+        apply_autostart(previous_config.auto_start_scope)
+    except Exception as exc:
+        logger.exception("Failed to roll back autostart settings.")
+        rollback_errors.append(f"自動啟動回復失敗：{exc}")
+
+    try:
+        save_config(previous_config, previous_resolved_paths.config_path)
+    except Exception as exc:
+        logger.exception("Failed to roll back config file at %s", previous_resolved_paths.config_path)
+        rollback_errors.append(f"設定檔回復失敗：{exc}")
+
+    if transient_config_path and transient_config_path != previous_resolved_paths.config_path:
+        try:
+            transient_config_path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.exception("Failed to remove staged config file at %s", transient_config_path)
+            rollback_errors.append(f"暫存設定清理失敗：{exc}")
+
+    try:
+        restored_paths = update_bootstrap_for_storage(previous_config.storage)
+    except Exception as exc:
+        logger.exception("Failed to roll back bootstrap storage settings.")
+        restored_paths = previous_resolved_paths
+        rollback_errors.append(f"啟動設定回復失敗：{exc}")
+
+    try:
+        configure_logging(restored_paths.log_directory)
+    except Exception as exc:
+        logger.exception("Failed to roll back logging configuration.")
+        rollback_errors.append(f"日誌設定回復失敗：{exc}")
+
+    return restored_paths, rollback_errors
+
+
+def _apply_system_settings_transaction(
+    requested_storage: StoragePreferences,
+    scope: AutoStartScope,
+    start_on_login: bool,
+    current_config: AppConfig,
+    current_resolved_paths: ResolvedPaths,
+) -> SystemSettingsApplyResult | SystemSettingsApplyFailure:
+    previous_config = _clone_config(current_config)
+    previous_resolved_paths = current_resolved_paths
+    planned_paths: ResolvedPaths | None = None
+
+    try:
+        planned_paths = resolve_paths(requested_storage)
+        effective_storage = effective_storage_preferences(planned_paths)
+        candidate = _clone_config(current_config)
+        candidate.storage = effective_storage
+        candidate.auto_start_scope = scope
+        candidate.start_monitoring_on_login = start_on_login
+
+        status = apply_autostart(scope)
+        candidate.auto_start_provider = status.provider or AutoStartProvider.NONE
+        save_config(candidate, planned_paths.config_path)
+        resolved = update_bootstrap_for_storage(effective_storage)
+        active_log_path = configure_logging(resolved.log_directory)
+    except Exception as exc:
+        if "需要系統管理員權限" in str(exc):
+            logger.warning("Failed to persist system settings: %s", exc)
+        else:
+            logger.exception("Failed to persist system settings.")
+        restored_paths, rollback_errors = _rollback_system_settings_side_effects(
+            previous_config,
+            previous_resolved_paths,
+            planned_paths.config_path if planned_paths is not None else None,
+        )
+        return SystemSettingsApplyFailure(
+            previous_config=previous_config,
+            restored_paths=restored_paths,
+            message=str(exc),
+            rollback_errors=rollback_errors,
+        )
+
+    return SystemSettingsApplyResult(
+        candidate=candidate,
+        resolved_paths=resolved,
+        active_log_path=active_log_path,
+        scope=scope,
+    )
+
+
+class SystemSettingsApplyWorker(QObject):
+    finished = Signal(object)
+
+    def __init__(
+        self,
+        requested_storage: StoragePreferences,
+        scope: AutoStartScope,
+        start_on_login: bool,
+        current_config: AppConfig,
+        current_resolved_paths: ResolvedPaths,
+    ) -> None:
+        super().__init__()
+        self._requested_storage = requested_storage
+        self._scope = scope
+        self._start_on_login = start_on_login
+        self._current_config = _clone_config(current_config)
+        self._current_resolved_paths = current_resolved_paths
+
+    def run(self) -> None:
+        try:
+            result = _apply_system_settings_transaction(
+                self._requested_storage,
+                self._scope,
+                self._start_on_login,
+                self._current_config,
+                self._current_resolved_paths,
+            )
+        except Exception as exc:
+            logger.exception("Unexpected failure in system settings apply worker.")
+            result = SystemSettingsApplyFailure(
+                previous_config=self._current_config,
+                restored_paths=self._current_resolved_paths,
+                message=str(exc),
+                rollback_errors=[],
+            )
+        self.finished.emit(result)
 
 
 def _move_aside_invalid_file(path: Path, marker: str) -> Path | None:
@@ -248,6 +414,9 @@ class AppController(QObject):
         self._resolved_paths = resolved_paths
         self._single_instance = single_instance
         self._exit_reason: ExitReason | None = None
+        self._system_settings_thread: QThread | None = None
+        self._system_settings_worker: SystemSettingsApplyWorker | None = None
+        self._system_settings_progress: QProgressDialog | None = None
         self._fallback_icon = self._build_fallback_icon()
         self._ready_icon, self._not_ready_icon = self._load_status_icons()
 
@@ -340,7 +509,7 @@ class AppController(QObject):
 
     @staticmethod
     def _clone_config(config: AppConfig) -> AppConfig:
-        return AppConfig.from_dict(config.validate().to_dict())
+        return _clone_config(config)
 
     def _apply_live_config(self, config: AppConfig) -> None:
         canonical = self._clone_config(config)
@@ -416,52 +585,11 @@ class AppController(QObject):
         if warning:
             QMessageBox.warning(self._window, "設定檔已重設", warning)
 
-    def _rollback_system_settings(
-        self,
-        previous_config: AppConfig,
-        previous_resolved_paths,
-        transient_config_path: Path | None = None,
-    ) -> list[str]:
-        rollback_errors: list[str] = []
-
-        try:
-            apply_autostart(previous_config.auto_start_scope)
-        except Exception as exc:
-            logger.exception("Failed to roll back autostart settings.")
-            rollback_errors.append(f"自動啟動回復失敗：{exc}")
-
-        try:
-            save_config(previous_config, previous_resolved_paths.config_path)
-        except Exception as exc:
-            logger.exception("Failed to roll back config file at %s", previous_resolved_paths.config_path)
-            rollback_errors.append(f"設定檔回復失敗：{exc}")
-
-        if transient_config_path and transient_config_path != previous_resolved_paths.config_path:
-            try:
-                transient_config_path.unlink(missing_ok=True)
-            except OSError as exc:
-                logger.exception("Failed to remove staged config file at %s", transient_config_path)
-                rollback_errors.append(f"暫存設定清理失敗：{exc}")
-
-        try:
-            restored_paths = update_bootstrap_for_storage(previous_config.storage)
-        except Exception as exc:
-            logger.exception("Failed to roll back bootstrap storage settings.")
-            restored_paths = previous_resolved_paths
-            rollback_errors.append(f"啟動設定回復失敗：{exc}")
-
-        try:
-            configure_logging(restored_paths.log_directory)
-        except Exception as exc:
-            logger.exception("Failed to roll back logging configuration.")
-            rollback_errors.append(f"日誌設定回復失敗：{exc}")
-
-        self._resolved_paths = restored_paths
-        self._window.set_resolved_paths(restored_paths)
-        self._apply_live_config(previous_config)
-        return rollback_errors
-
     def open_system_settings_dialog(self) -> None:
+        if self._system_settings_thread is not None:
+            QMessageBox.information(self._window, "正在套用系統設定", "系統設定仍在套用中，請稍候。")
+            return
+
         dialog = SystemSettingsDialog(
             self._config.storage,
             self._resolved_paths,
@@ -473,38 +601,79 @@ class AppController(QObject):
             return
 
         requested_storage, scope, start_on_login = dialog.values()
-        previous_config = self._clone_config(self._config)
-        previous_resolved_paths = self._resolved_paths
-        planned_paths = resolve_paths(requested_storage)
-        effective_storage = effective_storage_preferences(planned_paths)
-        candidate = self._clone_config(self._config)
-        candidate.storage = effective_storage
-        candidate.auto_start_scope = scope
-        candidate.start_monitoring_on_login = start_on_login
-        try:
-            status = apply_autostart(scope)
-            candidate.auto_start_provider = status.provider or AutoStartProvider.NONE
-            save_config(candidate, planned_paths.config_path)
-            resolved = update_bootstrap_for_storage(effective_storage)
-            active_log_path = configure_logging(resolved.log_directory)
-        except Exception as exc:
-            if "需要系統管理員權限" in str(exc):
-                logger.warning("Failed to persist system settings: %s", exc)
-            else:
-                logger.exception("Failed to persist system settings.")
-            rollback_errors = self._rollback_system_settings(
-                previous_config,
-                previous_resolved_paths,
-                planned_paths.config_path,
-            )
-            message = f"系統設定儲存失敗：{exc}"
-            if rollback_errors:
+        self._start_system_settings_apply(requested_storage, scope, start_on_login)
+
+    def _start_system_settings_apply(
+        self,
+        requested_storage: StoragePreferences,
+        scope: AutoStartScope,
+        start_on_login: bool,
+    ) -> None:
+        self._show_system_settings_progress()
+
+        thread = QThread(self)
+        worker = SystemSettingsApplyWorker(
+            requested_storage,
+            scope,
+            start_on_login,
+            self._config,
+            self._resolved_paths,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._handle_system_settings_apply_result)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._cleanup_system_settings_apply)
+
+        self._system_settings_thread = thread
+        self._system_settings_worker = worker
+        logger.info("Started background system settings apply. auto_start_scope=%s", scope.value)
+        thread.start()
+
+    def _show_system_settings_progress(self) -> None:
+        self._close_system_settings_progress()
+        progress = QProgressDialog("正在套用系統設定，請稍候...", "", 0, 0, self._window)
+        progress.setWindowTitle("套用系統設定")
+        progress.setCancelButton(None)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.show()
+        self._system_settings_progress = progress
+
+    def _close_system_settings_progress(self) -> None:
+        if self._system_settings_progress is None:
+            return
+        self._system_settings_progress.close()
+        self._system_settings_progress.deleteLater()
+        self._system_settings_progress = None
+
+    def _cleanup_system_settings_apply(self) -> None:
+        self._system_settings_thread = None
+        self._system_settings_worker = None
+
+    def _handle_system_settings_apply_result(
+        self,
+        result: SystemSettingsApplyResult | SystemSettingsApplyFailure,
+    ) -> None:
+        self._close_system_settings_progress()
+        if isinstance(result, SystemSettingsApplyFailure):
+            self._resolved_paths = result.restored_paths
+            self._window.set_resolved_paths(result.restored_paths)
+            self._apply_live_config(result.previous_config)
+            message = f"系統設定儲存失敗：{result.message}"
+            if result.rollback_errors:
                 message = f"{message}\n\n已嘗試回復原設定，但以下項目回復失敗：\n" + "\n".join(
-                    rollback_errors
+                    result.rollback_errors
                 )
             QMessageBox.warning(self._window, "系統設定儲存失敗", message)
             return
 
+        resolved = result.resolved_paths
+        candidate = result.candidate
         self._resolved_paths = resolved
         self._window.set_resolved_paths(resolved)
         self._apply_live_config(candidate)
@@ -512,10 +681,10 @@ class AppController(QObject):
             "Persisted system settings. config_path=%s log_root=%s active_log=%s auto_start_scope=%s",
             resolved.config_path,
             log_output_root(resolved.log_directory),
-            active_log_path,
-            scope.value,
+            result.active_log_path,
+            result.scope.value,
         )
-        if effective_storage != requested_storage:
+        if resolved.config_fallback_used or resolved.log_fallback_used:
             logger.warning(
                 "Requested storage was not writable; falling back to config=%s log=%s.",
                 candidate.storage.config_mode.value,
@@ -529,6 +698,9 @@ class AppController(QObject):
 
     def exit_user(self) -> None:
         logger.info("User requested application exit from tray menu.")
+        if self._system_settings_thread is not None:
+            QMessageBox.warning(self._window, "正在套用系統設定", "系統設定仍在套用中，請等待完成後再結束。")
+            return
         if self._window.has_unsaved_changes():
             decision = QMessageBox.question(
                 self._window,

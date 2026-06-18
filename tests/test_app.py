@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 import sys
+import threading
 
 import pytest
 from PySide6.QtCore import QObject, QPoint, Qt, Signal
@@ -165,6 +166,24 @@ class DummyCustomStorageSystemSettingsDialog(DummySystemSettingsDialog):
             AutoStartScope.CURRENT_USER,
             False,
         )
+
+
+class DummyMixedStorageSystemSettingsDialog(DummySystemSettingsDialog):
+    def values(self) -> tuple[StoragePreferences, AutoStartScope, bool]:
+        return (
+            StoragePreferences(
+                config_mode="exe",
+                log_mode="custom",
+                config_custom_path="D:/ShouldBeIgnored",
+                log_custom_path="E:/CustomLogs",
+            ),
+            AutoStartScope.CURRENT_USER,
+            False,
+        )
+
+
+def _wait_for_system_settings_apply(controller: AppController, qtbot) -> None:
+    qtbot.waitUntil(lambda: controller._system_settings_thread is None, timeout=5000)
 
 
 def _solid_icon(color: Qt.GlobalColor) -> QIcon:
@@ -735,9 +754,86 @@ def test_open_system_settings_dialog_persists_disabled_provider_as_none(monkeypa
     qtbot.addWidget(controller._window)
 
     controller.open_system_settings_dialog()
+    _wait_for_system_settings_apply(controller, qtbot)
 
     assert controller._config.auto_start_scope == AutoStartScope.DISABLED
     assert controller._config.auto_start_provider == AutoStartProvider.NONE
+
+
+def test_open_system_settings_dialog_applies_in_background_and_shows_progress(
+    monkeypatch,
+    qtbot,
+    tmp_path,
+) -> None:
+    app = QApplication.instance()
+    assert app is not None
+
+    monkeypatch.setattr("watchdog_app.app.MonitorEngine", DummyMonitorEngine)
+    monkeypatch.setattr("watchdog_app.app.MainWindow", DummyMainWindow)
+    monkeypatch.setattr("watchdog_app.app.QSystemTrayIcon", DummyTrayIcon)
+    monkeypatch.setattr(
+        "watchdog_app.app.AppController._load_status_icons",
+        lambda self: (_solid_icon(Qt.GlobalColor.green), _solid_icon(Qt.GlobalColor.red)),
+    )
+    monkeypatch.setattr("watchdog_app.app.SystemSettingsDialog", DummyChangingSystemSettingsDialog)
+    monkeypatch.setattr(
+        "watchdog_app.app.resolve_paths",
+        lambda _storage: ResolvedPaths(
+            bootstrap_path=tmp_path / "bootstrap.json",
+            config_path=tmp_path / "config.json",
+            log_directory=tmp_path / "logs",
+        ),
+    )
+    monkeypatch.setattr("watchdog_app.app.save_config", lambda config, path: path)
+    monkeypatch.setattr(
+        "watchdog_app.app.update_bootstrap_for_storage",
+        lambda _storage: ResolvedPaths(
+            bootstrap_path=tmp_path / "bootstrap.json",
+            config_path=tmp_path / "config.json",
+            log_directory=tmp_path / "logs",
+        ),
+    )
+    monkeypatch.setattr("watchdog_app.app.configure_logging", lambda *_args, **_kwargs: None)
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def _slow_autostart(scope: AutoStartScope):
+        started.set()
+        assert release.wait(timeout=2.0)
+        return AutoStartStatus(
+            scope=scope,
+            provider=AutoStartProvider.REGISTRY_RUN,
+            enabled=True,
+        )
+
+    monkeypatch.setattr("watchdog_app.app.apply_autostart", _slow_autostart)
+
+    controller = AppController(
+        app,
+        AppConfig.default(),
+        ResolvedPaths(
+            bootstrap_path=tmp_path / "bootstrap.json",
+            config_path=tmp_path / "config.json",
+            log_directory=tmp_path / "logs",
+        ),
+        DummySingleInstance(),
+    )
+    qtbot.addWidget(controller._window)
+
+    controller.open_system_settings_dialog()
+
+    qtbot.waitUntil(started.is_set, timeout=2000)
+    assert controller._system_settings_thread is not None
+    assert controller._system_settings_progress is not None
+    assert controller._system_settings_progress.isVisible()
+    assert controller._config.auto_start_scope == AutoStartScope.DISABLED
+
+    release.set()
+    _wait_for_system_settings_apply(controller, qtbot)
+
+    assert controller._system_settings_progress is None
+    assert controller._config.auto_start_scope == AutoStartScope.CURRENT_USER
 
 
 def test_open_system_settings_dialog_rolls_back_partial_side_effects_when_save_fails(
@@ -822,6 +918,7 @@ def test_open_system_settings_dialog_rolls_back_partial_side_effects_when_save_f
     qtbot.addWidget(controller._window)
 
     controller.open_system_settings_dialog()
+    _wait_for_system_settings_apply(controller, qtbot)
 
     assert autostart_calls == [AutoStartScope.CURRENT_USER, AutoStartScope.DISABLED]
     assert save_calls == [
@@ -895,6 +992,7 @@ def test_open_system_settings_dialog_persists_effective_storage_modes_after_fall
     qtbot.addWidget(controller._window)
 
     controller.open_system_settings_dialog()
+    _wait_for_system_settings_apply(controller, qtbot)
 
     assert saved[0].storage == StoragePreferences(config_mode="appdata", log_mode="localappdata")
     assert controller._config.storage == StoragePreferences(config_mode="appdata", log_mode="localappdata")
@@ -963,6 +1061,7 @@ def test_open_system_settings_dialog_persists_custom_storage_paths(
     qtbot.addWidget(controller._window)
 
     controller.open_system_settings_dialog()
+    _wait_for_system_settings_apply(controller, qtbot)
 
     assert saved[0].storage == StoragePreferences(
         config_mode=StorageMode.CUSTOM,
@@ -972,6 +1071,72 @@ def test_open_system_settings_dialog_persists_custom_storage_paths(
     )
     assert controller._config.storage == saved[0].storage
     assert controller._resolved_paths == resolved
+
+
+def test_open_system_settings_dialog_does_not_warn_for_non_custom_prefill_values(
+    monkeypatch,
+    qtbot,
+    tmp_path,
+) -> None:
+    app = QApplication.instance()
+    assert app is not None
+
+    monkeypatch.setattr("watchdog_app.app.MonitorEngine", DummyMonitorEngine)
+    monkeypatch.setattr("watchdog_app.app.MainWindow", DummyMainWindow)
+    monkeypatch.setattr("watchdog_app.app.QSystemTrayIcon", DummyTrayIcon)
+    monkeypatch.setattr(
+        "watchdog_app.app.AppController._load_status_icons",
+        lambda self: (_solid_icon(Qt.GlobalColor.green), _solid_icon(Qt.GlobalColor.red)),
+    )
+    monkeypatch.setattr("watchdog_app.app.SystemSettingsDialog", DummyMixedStorageSystemSettingsDialog)
+    monkeypatch.setattr(
+        "watchdog_app.app.apply_autostart",
+        lambda scope: AutoStartStatus(scope=scope, provider=AutoStartProvider.REGISTRY_RUN, enabled=True),
+    )
+
+    resolved = ResolvedPaths(
+        bootstrap_path=tmp_path / "bootstrap.json",
+        config_path=tmp_path / "config.json",
+        log_directory=Path("E:/CustomLogs"),
+        config_fallback_used=False,
+        log_fallback_used=False,
+    )
+    monkeypatch.setattr("watchdog_app.app.resolve_paths", lambda _storage: resolved)
+    monkeypatch.setattr(
+        "watchdog_app.app.effective_storage_preferences",
+        lambda _resolved: StoragePreferences(config_mode="exe", log_mode="custom", log_custom_path="E:/CustomLogs"),
+    )
+    monkeypatch.setattr("watchdog_app.app.update_bootstrap_for_storage", lambda _storage: resolved)
+    monkeypatch.setattr("watchdog_app.app.configure_logging", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("watchdog_app.app.save_config", lambda config, path: path)
+
+    warnings: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "watchdog_app.app.QMessageBox.warning",
+        lambda _parent, title, text: warnings.append((title, text)),
+    )
+
+    controller = AppController(
+        app,
+        AppConfig.default(),
+        ResolvedPaths(
+            bootstrap_path=tmp_path / "bootstrap.json",
+            config_path=tmp_path / "config.json",
+            log_directory=tmp_path / "logs",
+        ),
+        DummySingleInstance(),
+    )
+    qtbot.addWidget(controller._window)
+
+    controller.open_system_settings_dialog()
+    _wait_for_system_settings_apply(controller, qtbot)
+
+    assert warnings == []
+    assert controller._config.storage == StoragePreferences(
+        config_mode=StorageMode.EXE,
+        log_mode=StorageMode.CUSTOM,
+        log_custom_path="E:/CustomLogs",
+    )
 
 
 def test_open_system_settings_dialog_removes_staged_config_when_later_step_fails(
@@ -1054,6 +1219,7 @@ def test_open_system_settings_dialog_removes_staged_config_when_later_step_fails
     qtbot.addWidget(controller._window)
 
     controller.open_system_settings_dialog()
+    _wait_for_system_settings_apply(controller, qtbot)
 
     assert staged_path.exists() is False
     assert previous_path.read_text(encoding="utf-8") == "disabled"
