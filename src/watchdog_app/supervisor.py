@@ -29,7 +29,7 @@ class Supervisor:
         while True:
             command = [*child_command(), *self._child_args]
             logger.info("Launching child app: %s", command)
-            completed = subprocess.run(command, **self._child_run_kwargs())  # noqa: S603
+            completed = subprocess.run(command, **self._child_run_kwargs(command))  # noqa: S603
             reason = ExitReason.from_exit_code(completed.returncode)
 
             if reason in NON_RESTART_REASONS:
@@ -46,9 +46,9 @@ class Supervisor:
             backoff_seconds = min(backoff_seconds * 2.0, 30.0)
 
     @staticmethod
-    def _child_run_kwargs() -> dict[str, object]:
+    def _child_run_kwargs(command: list[str]) -> dict[str, object]:
         kwargs: dict[str, object] = {"check": False}
-        if os.name != "nt":
+        if os.name != "nt" or not Supervisor._should_hide_child_window(command):
             return kwargs
 
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -63,3 +63,10 @@ class Supervisor:
         if creationflags:
             kwargs["creationflags"] = creationflags
         return kwargs
+
+    @staticmethod
+    def _should_hide_child_window(command: list[str]) -> bool:
+        if not command:
+            return False
+        executable = os.path.basename(command[0]).casefold()
+        return executable in {"python.exe", "python", "py.exe"}

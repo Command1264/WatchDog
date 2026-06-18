@@ -75,7 +75,7 @@ def default_log_path() -> Path:
 def child_command() -> list[str]:
     if is_frozen():
         return [normalize_path_text(executable_path()), "--child-app"]
-    return [normalize_path_text(sys.executable), "-m", "watchdog_app.main", "--child-app"]
+    return [normalize_path_text(sys.executable), normalize_path_text(package_dir() / "main.py"), "--child-app"]
 
 
 def startup_host_executable() -> str:
@@ -97,7 +97,7 @@ def startup_host_executable() -> str:
 def startup_command() -> list[str]:
     if is_frozen():
         return [normalize_path_text(executable_path())]
-    return [startup_host_executable(), "-m", "watchdog_app.main"]
+    return [startup_host_executable(), normalize_path_text(package_dir() / "main.py")]
 
 
 def startup_command_line() -> str:

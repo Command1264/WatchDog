@@ -23,12 +23,32 @@ def test_supervisor_restarts_until_non_restart_reason(monkeypatch: object) -> No
 
     monkeypatch.setattr("watchdog_app.supervisor.subprocess.run", _run)
     monkeypatch.setattr("watchdog_app.supervisor.time.sleep", lambda _: None)
+    monkeypatch.setattr("watchdog_app.supervisor.child_command", lambda: ["D:/Apps/WatchDog.exe", "--child-app"])
 
     code = Supervisor().run()
 
     assert code == ExitReason.USER_EXIT.value
     assert calls["count"] == 2
     assert all(item["check"] is False for item in kwargs_seen)
-    assert all("startupinfo" in item for item in kwargs_seen)
+    assert all("startupinfo" not in item for item in kwargs_seen)
     if hasattr(subprocess, "CREATE_NO_WINDOW"):
-        assert all(item.get("creationflags") == subprocess.CREATE_NO_WINDOW for item in kwargs_seen)
+        assert all("creationflags" not in item for item in kwargs_seen)
+
+
+def test_supervisor_hides_child_window_only_for_console_hosts(monkeypatch: object) -> None:
+    monkeypatch.setattr("watchdog_app.supervisor.os.name", "nt")
+
+    kwargs = Supervisor._child_run_kwargs(["C:/Python312/python.exe", "-m", "watchdog_app.main", "--child-app"])
+
+    assert kwargs["check"] is False
+    assert "startupinfo" in kwargs
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        assert kwargs.get("creationflags") == subprocess.CREATE_NO_WINDOW
+
+
+def test_supervisor_does_not_hide_frozen_watchdog_exe(monkeypatch: object) -> None:
+    monkeypatch.setattr("watchdog_app.supervisor.os.name", "nt")
+
+    kwargs = Supervisor._child_run_kwargs(["D:/Apps/WatchDog.exe", "--child-app"])
+
+    assert kwargs == {"check": False}
