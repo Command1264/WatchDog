@@ -72,6 +72,8 @@ else:
 
 
 logger = logging.getLogger(__name__)
+SYSTEM_SETTINGS_SHUTDOWN_WAIT_SECONDS = 30.0
+SYSTEM_SETTINGS_SHUTDOWN_POLL_SECONDS = 0.05
 
 
 def _clone_config(config: AppConfig) -> AppConfig:
@@ -651,6 +653,36 @@ class AppController(QObject):
         self._system_settings_progress.deleteLater()
         self._system_settings_progress = None
 
+    def _wait_for_system_settings_apply_before_shutdown(self) -> bool:
+        if self._system_settings_thread is None:
+            return True
+
+        logger.info("Waiting for background system settings apply before shutdown.")
+        deadline = time.monotonic() + SYSTEM_SETTINGS_SHUTDOWN_WAIT_SECONDS
+        while self._system_settings_thread is not None:
+            self._app.processEvents()
+            active_thread = self._system_settings_thread
+            if active_thread is None:
+                return True
+
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                logger.error(
+                    "Timed out waiting for background system settings apply before shutdown."
+                )
+                return False
+
+            wait_milliseconds = max(
+                1,
+                min(
+                    int(SYSTEM_SETTINGS_SHUTDOWN_POLL_SECONDS * 1000),
+                    int(remaining_seconds * 1000),
+                ),
+            )
+            active_thread.wait(wait_milliseconds)
+
+        return True
+
     def _cleanup_system_settings_apply(self) -> None:
         self._system_settings_thread = None
         self._system_settings_worker = None
@@ -722,6 +754,8 @@ class AppController(QObject):
         if self._exit_reason is not None:
             return
         logger.info("Application exit requested. reason=%s", reason.name)
+        if self._system_settings_thread is not None:
+            self._wait_for_system_settings_apply_before_shutdown()
         self._exit_reason = reason
         self._monitor.shutdown()
         self._tray.hide()
@@ -733,6 +767,8 @@ class AppController(QObject):
         self._request_exit(ExitReason.OS_SESSION_END)
 
     def _about_to_quit(self) -> None:
+        if self._system_settings_thread is not None:
+            self._wait_for_system_settings_apply_before_shutdown()
         if self._exit_reason is None:
             self._exit_reason = ExitReason.UNEXPECTED_TERMINATION
 

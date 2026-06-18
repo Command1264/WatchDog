@@ -836,6 +836,86 @@ def test_open_system_settings_dialog_applies_in_background_and_shows_progress(
     assert controller._config.auto_start_scope == AutoStartScope.CURRENT_USER
 
 
+def test_session_end_waits_for_system_settings_apply_before_exit(
+    monkeypatch,
+    qtbot,
+    tmp_path,
+) -> None:
+    app = QApplication.instance()
+    assert app is not None
+
+    monkeypatch.setattr("watchdog_app.app.MonitorEngine", DummyMonitorEngine)
+    monkeypatch.setattr("watchdog_app.app.MainWindow", DummyMainWindow)
+    monkeypatch.setattr("watchdog_app.app.QSystemTrayIcon", DummyTrayIcon)
+    monkeypatch.setattr(
+        "watchdog_app.app.AppController._load_status_icons",
+        lambda self: (_solid_icon(Qt.GlobalColor.green), _solid_icon(Qt.GlobalColor.red)),
+    )
+    monkeypatch.setattr("watchdog_app.app.SystemSettingsDialog", DummyChangingSystemSettingsDialog)
+    monkeypatch.setattr(
+        "watchdog_app.app.resolve_paths",
+        lambda _storage: ResolvedPaths(
+            bootstrap_path=tmp_path / "bootstrap.json",
+            config_path=tmp_path / "config.json",
+            log_directory=tmp_path / "logs",
+        ),
+    )
+    monkeypatch.setattr("watchdog_app.app.save_config", lambda config, path: path)
+    monkeypatch.setattr(
+        "watchdog_app.app.update_bootstrap_for_storage",
+        lambda _storage: ResolvedPaths(
+            bootstrap_path=tmp_path / "bootstrap.json",
+            config_path=tmp_path / "config.json",
+            log_directory=tmp_path / "logs",
+        ),
+    )
+    monkeypatch.setattr("watchdog_app.app.configure_logging", lambda *_args, **_kwargs: None)
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def _slow_autostart(scope: AutoStartScope):
+        started.set()
+        assert release.wait(timeout=2.0)
+        return AutoStartStatus(
+            scope=scope,
+            provider=AutoStartProvider.REGISTRY_RUN,
+            enabled=True,
+        )
+
+    monkeypatch.setattr("watchdog_app.app.apply_autostart", _slow_autostart)
+
+    controller = AppController(
+        app,
+        AppConfig.default(),
+        ResolvedPaths(
+            bootstrap_path=tmp_path / "bootstrap.json",
+            config_path=tmp_path / "config.json",
+            log_directory=tmp_path / "logs",
+        ),
+        DummySingleInstance(),
+    )
+    qtbot.addWidget(controller._window)
+    exit_codes: list[int] = []
+    monkeypatch.setattr(controller._app, "exit", lambda code=0: exit_codes.append(code))
+
+    controller.open_system_settings_dialog()
+    qtbot.waitUntil(started.is_set, timeout=2000)
+
+    release_timer = threading.Timer(0.05, release.set)
+    release_timer.start()
+    try:
+        controller._handle_session_end()
+    finally:
+        release_timer.cancel()
+        release.set()
+
+    assert controller._system_settings_thread is None
+    assert controller.exit_reason == ExitReason.OS_SESSION_END
+    assert exit_codes == [ExitReason.OS_SESSION_END.value]
+    assert controller._config.auto_start_scope == AutoStartScope.CURRENT_USER
+
+
 def test_open_system_settings_dialog_rolls_back_partial_side_effects_when_save_fails(
     monkeypatch,
     qtbot,
