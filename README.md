@@ -10,3 +10,9 @@ Build from `cmd.exe`:
 Log files are written under:
 
 - `<log storage root>\WatchDogLogs\<yyyy-MM-dd>\WatchDog_<yyyy-MM-dd-HH-mm-ss>.log`
+
+Autostart providers are attempted in this order:
+
+- Windows Run registry key.
+- Windows Task Scheduler logon task.
+- Windows Startup folder shortcut (`WatchDog.lnk`) as the final fallback.

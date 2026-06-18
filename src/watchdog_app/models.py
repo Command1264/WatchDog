@@ -77,6 +77,7 @@ class AutoStartProvider(str, Enum):
     NONE = "none"
     REGISTRY_RUN = "registry_run"
     SCHEDULED_TASK = "scheduled_task"
+    STARTUP_FOLDER = "startup_folder"
 
 
 def _coerce_enum(enum_type: type[Enum], value: Enum | str) -> Enum:
