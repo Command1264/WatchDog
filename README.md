@@ -11,6 +11,24 @@ WatchDog 是一個 Windows-first watchdog tray application，以 Python 與 PySi
 - 使用模組化 `src/watchdog_app` 結構，並以 pytest 覆蓋主要行為。
 - 支援 PyInstaller 與 Nuitka 打包成 Windows 可執行檔。
 
+## 監控流程
+
+```mermaid
+flowchart LR
+    A["使用者啟動 WatchDog"] --> B["Single instance 檢查"]
+    B --> C["載入設定與 logging"]
+    C --> D["啟動 PySide6 tray application"]
+    D --> E["Supervisor 協調監控狀態"]
+    E --> F["Process monitor 檢查目標程序"]
+    F --> G{"程序是否執行中？"}
+    G -- "是" --> H["更新 tray 狀態與 log"]
+    G -- "否" --> I["Launcher 依設定啟動程序"]
+    I --> H
+    H --> F
+```
+
+WatchDog 將 UI、監控、啟動、狀態協調與儲存拆成獨立模組。GUI 負責操作入口與狀態顯示，`supervisor.py` 負責協調監控流程，`monitor.py` 與 `launchers.py` 分別處理程序檢查與啟動行為。
+
 ## 技術棧
 
 - Python 3.12
@@ -60,6 +78,20 @@ Autostart providers 會依序嘗試：
 
 此設計讓工具在不同 Windows 權限與環境下有 fallback 行為。
 
+```mermaid
+flowchart TD
+    A["啟用開機自動啟動"] --> B["嘗試 Windows Run registry"]
+    B --> C{"成功？"}
+    C -- "是" --> Z["儲存 autostart 狀態"]
+    C -- "否" --> D["嘗試 Task Scheduler logon task"]
+    D --> E{"成功？"}
+    E -- "是" --> Z
+    E -- "否" --> F["嘗試 Startup folder shortcut"]
+    F --> G{"成功？"}
+    G -- "是" --> Z
+    G -- "否" --> H["回報錯誤並寫入 log"]
+```
+
 ## 開發環境
 
 建立環境並安裝依賴：
@@ -94,6 +126,8 @@ scripts\build_nuitka.cmd
 
 打包輸出會依工具設定產生在對應的 build / dist 目錄。
 
+打包流程保留 PyInstaller 與 Nuitka 兩種路徑，方便比較啟動速度、檔案大小與相依套件處理結果。若只需要一般 Windows EXE，可先使用 PyInstaller；若要進一步調整效能或輸出形式，再使用 Nuitka。
+
 ## 測試範圍
 
 測試涵蓋：
@@ -107,6 +141,8 @@ scripts\build_nuitka.cmd
 - single instance
 - supervisor
 - UI behavior
+
+測試重點放在不依賴完整 GUI 操作也能驗證核心行為：autostart provider fallback、process monitor 判斷、launcher 參數、logging 路徑、storage 讀寫、single instance 與 supervisor 狀態協調。這讓後續修改監控或啟動流程時，可以先用 pytest 驗證主要邏輯。
 
 ## 注意事項
 
